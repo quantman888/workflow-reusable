@@ -1,0 +1,507 @@
+name: Release Dispatch Consumers
+
+on:
+  release:
+    types:
+      - published
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      consumer_repos:
+        description: "Target consumer repositories, separated by newline/comma/semicolon"
+        required: true
+        type: string
+      target_event_type:
+        description: "repository_dispatch event_type sent to consumer repositories"
+        required: false
+        type: string
+        default: "reusable-workflow-release"
+      dispatch_mode:
+        description: "Dispatch mode to consumer repositories: repository_dispatch|workflow_dispatch|both"
+        required: false
+        type: choice
+        default: "repository_dispatch"
+        options:
+          - repository_dispatch
+          - workflow_dispatch
+          - both
+      consumer_workflow_id:
+        description: "Consumer workflow file name or workflow ID (required for workflow_dispatch/both)"
+        required: false
+        type: string
+        default: ""
+      consumer_workflow_ref:
+        description: "Consumer workflow_dispatch ref (branch/tag/SHA)"
+        required: false
+        type: string
+        default: "main"
+      release_version:
+        description: "Release version propagated to consumer payload"
+        required: false
+        type: string
+        default: ""
+      target_ref:
+        description: "Target reusable workflow ref sent to consumers (40-hex SHA or v* tag)"
+        required: false
+        type: string
+        default: ""
+      target_sha:
+        description: "Target reusable workflow commit SHA sent to consumers"
+        required: false
+        type: string
+        default: ""
+      target_tag:
+        description: "Target reusable workflow tag sent to consumers (v*)"
+        required: false
+        type: string
+        default: ""
+      reusable_repo:
+        description: "Reusable workflow source repository sent to consumers"
+        required: false
+        type: string
+        default: "quantman888/workflow-reusable"
+      reusable_workflow_path:
+        description: "Reusable workflow path sent to consumers"
+        required: false
+        type: string
+        default: ".github/workflows/docker-publish.reusable.yml"
+      publish_channel:
+        description: "Publish channel propagated to consumer payload (edge|release)"
+        required: false
+        type: string
+        default: ""
+      image_ref:
+        description: "Published image reference propagated to consumer payload"
+        required: false
+        type: string
+        default: ""
+      image_tags:
+        description: "Published image tags propagated to consumer payload (comma-separated)"
+        required: false
+        type: string
+        default: ""
+      dry_run:
+        description: "Validate and print dispatch plan without sending API requests"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  batch-dispatch-consumers:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      total: ${{ steps.dispatch.outputs.total }}
+      success: ${{ steps.dispatch.outputs.success }}
+      failed: ${{ steps.dispatch.outputs.failed }}
+      result: ${{ steps.dispatch.outputs.result }}
+      dispatched_repositories: ${{ steps.dispatch.outputs.dispatched_repositories }}
+      failed_repositories: ${{ steps.dispatch.outputs.failed_repositories }}
+      target_event_type: ${{ steps.dispatch.outputs.target_event_type }}
+      dispatch_mode: ${{ steps.dispatch.outputs.dispatch_mode }}
+      dry_run: ${{ steps.dispatch.outputs.dry_run }}
+    steps:
+      - name: Dispatch release events to consumers
+        id: dispatch
+        env:
+          DISPATCH_TOKEN: ${{ secrets.CONSUMER_DISPATCH_TOKEN }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_EVENT_ACTION: ${{ github.event.action }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || '' }}
+          INPUT_CONSUMER_REPOS: ${{ github.event.inputs.consumer_repos || '' }}
+          INPUT_TARGET_EVENT_TYPE: ${{ github.event.inputs.target_event_type || '' }}
+          INPUT_DISPATCH_MODE: ${{ github.event.inputs.dispatch_mode || '' }}
+          INPUT_CONSUMER_WORKFLOW_ID: ${{ github.event.inputs.consumer_workflow_id || '' }}
+          INPUT_CONSUMER_WORKFLOW_REF: ${{ github.event.inputs.consumer_workflow_ref || '' }}
+          INPUT_RELEASE_VERSION: ${{ github.event.inputs.release_version || '' }}
+          INPUT_TARGET_REF: ${{ github.event.inputs.target_ref || '' }}
+          INPUT_TARGET_SHA: ${{ github.event.inputs.target_sha || '' }}
+          INPUT_TARGET_TAG: ${{ github.event.inputs.target_tag || '' }}
+          INPUT_REUSABLE_REPO: ${{ github.event.inputs.reusable_repo || '' }}
+          INPUT_REUSABLE_WORKFLOW_PATH: ${{ github.event.inputs.reusable_workflow_path || '' }}
+          INPUT_PUBLISH_CHANNEL: ${{ github.event.inputs.publish_channel || '' }}
+          INPUT_IMAGE_REF: ${{ github.event.inputs.image_ref || '' }}
+          INPUT_IMAGE_TAGS: ${{ github.event.inputs.image_tags || '' }}
+          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          PAYLOAD_CONSUMER_REPOS: ${{ github.event.client_payload.consumer_repos || '' }}
+          PAYLOAD_TARGET_EVENT_TYPE: ${{ github.event.client_payload.target_event_type || '' }}
+          PAYLOAD_DISPATCH_MODE: ${{ github.event.client_payload.dispatch_mode || '' }}
+          PAYLOAD_CONSUMER_WORKFLOW_ID: ${{ github.event.client_payload.consumer_workflow_id || '' }}
+          PAYLOAD_CONSUMER_WORKFLOW_REF: ${{ github.event.client_payload.consumer_workflow_ref || '' }}
+          PAYLOAD_RELEASE_VERSION: ${{ github.event.client_payload.release_version || '' }}
+          PAYLOAD_TARGET_REF: ${{ github.event.client_payload.target_ref || '' }}
+          PAYLOAD_TARGET_SHA: ${{ github.event.client_payload.target_sha || '' }}
+          PAYLOAD_TARGET_TAG: ${{ github.event.client_payload.target_tag || '' }}
+          PAYLOAD_REUSABLE_REPO: ${{ github.event.client_payload.reusable_repo || '' }}
+          PAYLOAD_REUSABLE_WORKFLOW_PATH: ${{ github.event.client_payload.reusable_workflow_path || '' }}
+          PAYLOAD_PUBLISH_CHANNEL: ${{ github.event.client_payload.publish_channel || '' }}
+          PAYLOAD_IMAGE_REF: ${{ github.event.client_payload.image_ref || '' }}
+          PAYLOAD_IMAGE_TAGS: ${{ github.event.client_payload.image_tags || '' }}
+          PAYLOAD_DRY_RUN: ${{ github.event.client_payload.dry_run || 'false' }}
+          VAR_CONSUMER_REPOS: ${{ vars.CONSUMER_REPOS || '' }}
+          VAR_TARGET_EVENT_TYPE: ${{ vars.CONSUMER_TARGET_EVENT_TYPE || '' }}
+          VAR_DISPATCH_MODE: ${{ vars.CONSUMER_DISPATCH_MODE || '' }}
+          VAR_CONSUMER_WORKFLOW_ID: ${{ vars.CONSUMER_WORKFLOW_ID || '' }}
+          VAR_CONSUMER_WORKFLOW_REF: ${{ vars.CONSUMER_WORKFLOW_REF || '' }}
+          VAR_REUSABLE_REPO: ${{ vars.REUSABLE_REPO || '' }}
+          VAR_REUSABLE_WORKFLOW_PATH: ${{ vars.REUSABLE_WORKFLOW_PATH || '' }}
+        run: |
+          set -euo pipefail
+
+          RESPONSE_HTTP_CODE=""
+          RESPONSE_BODY=""
+
+          json_escape() {
+            printf '%s' "$1" \
+              | sed -e 's/\\/\\\\/g' \
+                    -e 's/"/\\"/g' \
+                    -e ':a;N;$!ba;s/\n/\\n/g' \
+                    -e 's/\r/\\r/g'
+          }
+
+          append_csv() {
+            local value="${1}"
+            local current="${2}"
+            if [[ -z "${current}" ]]; then
+              printf '%s' "${value}"
+            else
+              printf '%s,%s' "${current}" "${value}"
+            fi
+          }
+
+          post_json() {
+            local url="${1}"
+            local payload="${2}"
+            local response_file
+            response_file="$(mktemp)"
+
+            if ! RESPONSE_HTTP_CODE="$(
+              curl --silent --show-error \
+                --output "${response_file}" \
+                --write-out "%{http_code}" \
+                --request POST \
+                --url "${url}" \
+                --header "Accept: application/vnd.github+json" \
+                --header "Authorization: Bearer ${DISPATCH_TOKEN}" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                --data "${payload}"
+            )"; then
+              rm -f "${response_file}"
+              return 2
+            fi
+
+            RESPONSE_BODY="$(sed ':a;N;$!ba;s/\n/ /g' "${response_file}" | sed 's/[[:space:]][[:space:]]*/ /g')"
+            rm -f "${response_file}"
+            return 0
+          }
+
+          if [[ -z "${DISPATCH_TOKEN}" ]]; then
+            echo "secret CONSUMER_DISPATCH_TOKEN is required for cross-repository dispatch" >&2
+            exit 1
+          fi
+
+          raw_consumer_repos=""
+          target_event_type=""
+          dispatch_mode=""
+          consumer_workflow_id=""
+          consumer_workflow_ref=""
+          release_version=""
+          target_ref=""
+          target_sha=""
+          target_tag=""
+          reusable_repo=""
+          reusable_workflow_path=""
+          publish_channel=""
+          image_ref=""
+          image_tags=""
+          dry_run="false"
+          upstream_event_type="${GITHUB_EVENT_NAME}"
+
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            raw_consumer_repos="${INPUT_CONSUMER_REPOS:-}"
+            target_event_type="${INPUT_TARGET_EVENT_TYPE:-}"
+            dispatch_mode="${INPUT_DISPATCH_MODE:-}"
+            consumer_workflow_id="${INPUT_CONSUMER_WORKFLOW_ID:-}"
+            consumer_workflow_ref="${INPUT_CONSUMER_WORKFLOW_REF:-}"
+            release_version="${INPUT_RELEASE_VERSION:-}"
+            target_ref="${INPUT_TARGET_REF:-}"
+            target_sha="${INPUT_TARGET_SHA:-}"
+            target_tag="${INPUT_TARGET_TAG:-}"
+            reusable_repo="${INPUT_REUSABLE_REPO:-}"
+            reusable_workflow_path="${INPUT_REUSABLE_WORKFLOW_PATH:-}"
+            publish_channel="${INPUT_PUBLISH_CHANNEL:-}"
+            image_ref="${INPUT_IMAGE_REF:-}"
+            image_tags="${INPUT_IMAGE_TAGS:-}"
+            dry_run="${INPUT_DRY_RUN:-false}"
+          elif [[ "${GITHUB_EVENT_NAME}" == "repository_dispatch" ]]; then
+            raw_consumer_repos="${PAYLOAD_CONSUMER_REPOS:-}"
+            target_event_type="${PAYLOAD_TARGET_EVENT_TYPE:-}"
+            dispatch_mode="${PAYLOAD_DISPATCH_MODE:-}"
+            consumer_workflow_id="${PAYLOAD_CONSUMER_WORKFLOW_ID:-}"
+            consumer_workflow_ref="${PAYLOAD_CONSUMER_WORKFLOW_REF:-}"
+            release_version="${PAYLOAD_RELEASE_VERSION:-}"
+            target_ref="${PAYLOAD_TARGET_REF:-}"
+            target_sha="${PAYLOAD_TARGET_SHA:-}"
+            target_tag="${PAYLOAD_TARGET_TAG:-}"
+            reusable_repo="${PAYLOAD_REUSABLE_REPO:-}"
+            reusable_workflow_path="${PAYLOAD_REUSABLE_WORKFLOW_PATH:-}"
+            publish_channel="${PAYLOAD_PUBLISH_CHANNEL:-}"
+            image_ref="${PAYLOAD_IMAGE_REF:-}"
+            image_tags="${PAYLOAD_IMAGE_TAGS:-}"
+            dry_run="${PAYLOAD_DRY_RUN:-false}"
+            upstream_event_type="${GITHUB_EVENT_ACTION:-repository_dispatch}"
+          elif [[ "${GITHUB_EVENT_NAME}" == "release" ]]; then
+            raw_consumer_repos="${VAR_CONSUMER_REPOS:-}"
+            target_event_type="${VAR_TARGET_EVENT_TYPE:-}"
+            dispatch_mode="${VAR_DISPATCH_MODE:-}"
+            consumer_workflow_id="${VAR_CONSUMER_WORKFLOW_ID:-}"
+            consumer_workflow_ref="${VAR_CONSUMER_WORKFLOW_REF:-}"
+            release_version="${RELEASE_TAG:-}"
+            target_tag="${RELEASE_TAG:-}"
+            reusable_repo="${VAR_REUSABLE_REPO:-}"
+            reusable_workflow_path="${VAR_REUSABLE_WORKFLOW_PATH:-}"
+            publish_channel="release"
+            upstream_event_type="release.published"
+          else
+            echo "unsupported event_name: ${GITHUB_EVENT_NAME}" >&2
+            exit 1
+          fi
+
+          if [[ -z "${target_event_type}" ]]; then
+            target_event_type="reusable-workflow-release"
+          fi
+
+          if [[ -z "${target_ref}" ]]; then
+            if [[ -n "${target_sha}" ]]; then
+              target_ref="${target_sha}"
+            elif [[ -n "${target_tag}" ]]; then
+              target_ref="${target_tag}"
+            elif [[ -n "${release_version}" ]]; then
+              target_ref="${release_version}"
+            fi
+          fi
+
+          if [[ -z "${target_ref}" ]]; then
+            echo "target_ref is required and must be derivable from inputs/release metadata." >&2
+            exit 1
+          fi
+
+          if [[ ! "${target_ref}" =~ ^[0-9a-fA-F]{40}$ && ! "${target_ref}" =~ ^v[0-9A-Za-z._-]+$ ]]; then
+            if [[ "${GITHUB_EVENT_NAME}" == "release" && "${GITHUB_SHA}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+              target_ref="${GITHUB_SHA}"
+              target_sha="${GITHUB_SHA}"
+            else
+              echo "target_ref must be full SHA or v* tag, got: ${target_ref}" >&2
+              exit 1
+            fi
+          fi
+
+          if [[ -z "${target_sha}" && "${target_ref}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            target_sha="${target_ref}"
+          fi
+
+          if [[ -z "${target_tag}" && "${target_ref}" =~ ^v[0-9A-Za-z._-]+$ ]]; then
+            target_tag="${target_ref}"
+          fi
+
+          if [[ -z "${reusable_repo}" ]]; then
+            reusable_repo="quantman888/workflow-reusable"
+          fi
+
+          if [[ -z "${reusable_workflow_path}" ]]; then
+            reusable_workflow_path=".github/workflows/docker-publish.reusable.yml"
+          fi
+
+          dispatch_mode="$(printf '%s' "${dispatch_mode}" | awk '{print tolower($0)}')"
+          if [[ -z "${dispatch_mode}" ]]; then
+            dispatch_mode="repository_dispatch"
+          fi
+
+          if [[ "${dispatch_mode}" != "repository_dispatch" && "${dispatch_mode}" != "workflow_dispatch" && "${dispatch_mode}" != "both" ]]; then
+            echo "invalid dispatch_mode: ${dispatch_mode} (allowed: repository_dispatch|workflow_dispatch|both)" >&2
+            exit 1
+          fi
+
+          if [[ "${dispatch_mode}" == "workflow_dispatch" || "${dispatch_mode}" == "both" ]]; then
+            if [[ -z "${consumer_workflow_id}" ]]; then
+              echo "consumer_workflow_id is required when dispatch_mode=${dispatch_mode}" >&2
+              exit 1
+            fi
+            if [[ -z "${consumer_workflow_ref}" ]]; then
+              consumer_workflow_ref="main"
+            fi
+          fi
+
+          if [[ -z "${raw_consumer_repos}" ]]; then
+            echo "consumer_repos is required (workflow_dispatch input / repository_dispatch payload / repository variable CONSUMER_REPOS)" >&2
+            exit 1
+          fi
+
+          dry_run="$(printf '%s' "${dry_run}" | awk '{print tolower($0)}')"
+          if [[ "${dry_run}" != "true" ]]; then
+            dry_run="false"
+          fi
+
+          normalized_repos="$(
+            printf '%s\n' "${raw_consumer_repos}" \
+              | tr ',;' '\n' \
+              | sed 's/\[//g' \
+              | sed 's/\]//g' \
+              | sed 's/\r$//' \
+              | sed 's/^[[:space:]]*//' \
+              | sed 's/[[:space:]]*$//' \
+              | sed 's/^"//' \
+              | sed 's/"$//' \
+              | sed "s/^'//" \
+              | sed "s/'$//" \
+              | awk 'NF > 0 && !seen[$0]++ { print $0 }'
+          )"
+
+          if [[ -z "${normalized_repos}" ]]; then
+            echo "no valid repositories found in consumer_repos" >&2
+            exit 1
+          fi
+
+          total="$(printf '%s\n' "${normalized_repos}" | awk 'NF {count++} END {print count + 0}')"
+          success_count=0
+          failed_count=0
+          dispatched_repos=""
+          failed_repos=""
+
+          while IFS= read -r repo; do
+            [[ -z "${repo}" ]] && continue
+
+            if ! printf '%s' "${repo}" | awk 'BEGIN { ok = 0 } /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/ { ok = 1 } END { exit(ok ? 0 : 1) }'; then
+              echo "invalid repository format: ${repo}" >&2
+              failed_count=$((failed_count + 1))
+              failed_repos="$(append_csv "${repo}" "${failed_repos}")"
+              continue
+            fi
+
+            repo_ok="true"
+
+            repo_dispatch_payload="$(
+              printf '{"event_type":"%s","client_payload":{"target_ref":"%s","target_sha":"%s","target_tag":"%s","reusable_repo":"%s","reusable_workflow_path":"%s","release_version":"%s","publish_channel":"%s","image_ref":"%s","image_tags":"%s","source_repository":"%s","source_sha":"%s","source_run_id":"%s","upstream_event_type":"%s"}}' \
+                "$(json_escape "${target_event_type}")" \
+                "$(json_escape "${target_ref}")" \
+                "$(json_escape "${target_sha}")" \
+                "$(json_escape "${target_tag}")" \
+                "$(json_escape "${reusable_repo}")" \
+                "$(json_escape "${reusable_workflow_path}")" \
+                "$(json_escape "${release_version}")" \
+                "$(json_escape "${publish_channel}")" \
+                "$(json_escape "${image_ref}")" \
+                "$(json_escape "${image_tags}")" \
+                "$(json_escape "${GITHUB_REPOSITORY}")" \
+                "$(json_escape "${GITHUB_SHA}")" \
+                "$(json_escape "${GITHUB_RUN_ID}")" \
+                "$(json_escape "${upstream_event_type}")"
+            )"
+
+            workflow_dispatch_payload="$(
+              printf '{"ref":"%s","inputs":{"target_ref":"%s"}}' \
+                "$(json_escape "${consumer_workflow_ref}")" \
+                "$(json_escape "${target_ref}")"
+            )"
+
+            if [[ "${dispatch_mode}" == "repository_dispatch" || "${dispatch_mode}" == "both" ]]; then
+              if [[ "${dry_run}" == "true" ]]; then
+                echo "[DRY_RUN] POST /repos/${repo}/dispatches event_type=${target_event_type}"
+              else
+                if ! post_json "https://api.github.com/repos/${repo}/dispatches" "${repo_dispatch_payload}"; then
+                  echo "repository_dispatch failed: repo=${repo} curl_error=true" >&2
+                  repo_ok="false"
+                elif [[ "${RESPONSE_HTTP_CODE}" != "204" ]]; then
+                  echo "repository_dispatch failed: repo=${repo} http=${RESPONSE_HTTP_CODE} body=${RESPONSE_BODY}" >&2
+                  repo_ok="false"
+                else
+                  echo "repository_dispatch ok: ${repo}"
+                fi
+              fi
+            fi
+
+            if [[ "${dispatch_mode}" == "workflow_dispatch" || "${dispatch_mode}" == "both" ]]; then
+              if [[ "${dry_run}" == "true" ]]; then
+                echo "[DRY_RUN] POST /repos/${repo}/actions/workflows/${consumer_workflow_id}/dispatches ref=${consumer_workflow_ref}"
+              else
+                if ! post_json "https://api.github.com/repos/${repo}/actions/workflows/${consumer_workflow_id}/dispatches" "${workflow_dispatch_payload}"; then
+                  echo "workflow_dispatch failed: repo=${repo} curl_error=true" >&2
+                  repo_ok="false"
+                elif [[ "${RESPONSE_HTTP_CODE}" != "204" ]]; then
+                  echo "workflow_dispatch failed: repo=${repo} http=${RESPONSE_HTTP_CODE} body=${RESPONSE_BODY}" >&2
+                  repo_ok="false"
+                else
+                  echo "workflow_dispatch ok: ${repo}"
+                fi
+              fi
+            fi
+
+            if [[ "${repo_ok}" == "true" ]]; then
+              success_count=$((success_count + 1))
+              dispatched_repos="$(append_csv "${repo}" "${dispatched_repos}")"
+            else
+              failed_count=$((failed_count + 1))
+              failed_repos="$(append_csv "${repo}" "${failed_repos}")"
+            fi
+          done <<< "${normalized_repos}"
+
+          result="success"
+          if [[ "${failed_count}" -gt 0 && "${success_count}" -eq 0 ]]; then
+            result="failed"
+          elif [[ "${failed_count}" -gt 0 ]]; then
+            result="partial"
+          fi
+
+          {
+            echo "total=${total}"
+            echo "success=${success_count}"
+            echo "failed=${failed_count}"
+            echo "result=${result}"
+            echo "dispatched_repositories=${dispatched_repos}"
+            echo "failed_repositories=${failed_repos}"
+            echo "target_event_type=${target_event_type}"
+            echo "dispatch_mode=${dispatch_mode}"
+            echo "dry_run=${dry_run}"
+          } >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "### Release Dispatch Consumers"
+            echo "- upstream_event_type: ${upstream_event_type}"
+            echo "- target_event_type: ${target_event_type}"
+            echo "- dispatch_mode: ${dispatch_mode}"
+            echo "- target_ref: ${target_ref}"
+            if [[ -n "${target_sha}" ]]; then
+              echo "- target_sha: ${target_sha}"
+            fi
+            if [[ -n "${target_tag}" ]]; then
+              echo "- target_tag: ${target_tag}"
+            fi
+            echo "- reusable_repo: ${reusable_repo}"
+            echo "- reusable_workflow_path: ${reusable_workflow_path}"
+            if [[ -n "${consumer_workflow_id}" ]]; then
+              echo "- consumer_workflow_id: ${consumer_workflow_id}"
+              echo "- consumer_workflow_ref: ${consumer_workflow_ref}"
+            fi
+            echo "- dry_run: ${dry_run}"
+            echo "- total: ${total}"
+            echo "- success: ${success_count}"
+            echo "- failed: ${failed_count}"
+            if [[ -n "${dispatched_repos}" ]]; then
+              echo "- dispatched_repositories: ${dispatched_repos}"
+            fi
+            if [[ -n "${failed_repos}" ]]; then
+              echo "- failed_repositories: ${failed_repos}"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          if [[ "${failed_count}" -gt 0 && "${dry_run}" != "true" ]]; then
+            exit 1
+          fi

@@ -1,0 +1,127 @@
+name: Workflow Reference Policy
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/*.yml"
+      - ".github/workflows/*.yaml"
+      - ".github/workflow-templates/*.yml"
+      - ".github/workflow-templates/*.yaml"
+      - "templates/**/*.yml"
+      - "templates/**/*.yaml"
+  push:
+    paths:
+      - ".github/workflows/*.yml"
+      - ".github/workflows/*.yaml"
+      - ".github/workflow-templates/*.yml"
+      - ".github/workflow-templates/*.yaml"
+      - "templates/**/*.yml"
+      - "templates/**/*.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-workflow-references:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Validate uses references policy
+        run: |
+          set -euo pipefail
+
+          refs_file="$(mktemp)"
+          errors_file="$(mktemp)"
+          files_file="$(mktemp)"
+          trap 'rm -f "${refs_file}" "${errors_file}" "${files_file}"' EXIT
+
+          scan_dirs=(
+            ".github/workflows"
+            ".github/workflow-templates"
+            "templates"
+          )
+
+          for dir in "${scan_dirs[@]}"; do
+            if [[ -d "${dir}" ]]; then
+              find "${dir}" -type f \( -name "*.yml" -o -name "*.yaml" \) >> "${files_file}"
+            fi
+          done
+
+          if [[ ! -s "${files_file}" ]]; then
+            echo "No workflow/template yaml files found."
+            exit 0
+          fi
+
+          while IFS= read -r file; do
+            awk -v file="${file}" '
+              /^[[:space:]]*uses:[[:space:]]*/ {
+                if ($0 ~ /workflow-ref-policy:[[:space:]]*ignore/) {
+                  next
+                }
+
+                ref = $0
+                sub(/^[[:space:]]*uses:[[:space:]]*/, "", ref)
+                sub(/[[:space:]]*#.*/, "", ref)
+                gsub(/^["'"'"']|["'"'"']$/, "", ref)
+                gsub(/[[:space:]]+$/, "", ref)
+
+                if (ref != "") {
+                  printf "%s\t%d\t%s\n", file, NR, ref
+                }
+              }
+            ' "${file}"
+          done < "${files_file}" > "${refs_file}"
+
+          if [[ ! -s "${refs_file}" ]]; then
+            echo "No uses references found in scanned workflow/template files."
+            exit 0
+          fi
+
+          while IFS=$'\t' read -r file line ref; do
+            expr_marker='$''{{'
+            if [[ "${ref}" == ./* || "${ref}" == ../* || "${ref}" == docker://* ]]; then
+              continue
+            fi
+
+            if [[ "${ref}" == *"${expr_marker}"* ]]; then
+              printf "%s:%s dynamic uses reference requires explicit exemption comment: %s\n" "${file}" "${line}" "${ref}" >> "${errors_file}"
+              continue
+            fi
+
+            if [[ "${ref}" != *@* ]]; then
+              printf "%s:%s uses reference must include @ref (or local path): %s\n" "${file}" "${line}" "${ref}" >> "${errors_file}"
+              continue
+            fi
+
+            ref_name="${ref##*@}"
+
+            if [[ "${ref_name}" == "main" ]]; then
+              printf "%s:%s uses reference with @main is forbidden: %s\n" "${file}" "${line}" "${ref}" >> "${errors_file}"
+              continue
+            fi
+
+            if [[ "${ref_name}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+              continue
+            fi
+
+            if [[ "${ref_name}" =~ ^v[0-9].* ]]; then
+              continue
+            fi
+
+            printf "%s:%s uses reference must be pinned to full SHA or controlled tag (v*): %s\n" "${file}" "${line}" "${ref}" >> "${errors_file}"
+          done < "${refs_file}"
+
+          if [[ -s "${errors_file}" ]]; then
+            echo "Workflow reference policy violations:"
+            cat "${errors_file}"
+            echo "If needed, add '# workflow-ref-policy: ignore' on the same uses line with a review reason."
+            exit 1
+          fi
+
+          echo "All workflow/template uses references comply with policy."

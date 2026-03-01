@@ -1,0 +1,232 @@
+name: Release Publish
+
+on:
+  push:
+    tags:
+      - "v*"
+      - "release-*"
+      - "release/*"
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (defaults to current ref when triggered from a tag)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: release_tag
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          RELEASE_EVENT_TAG: ${{ github.event.release.tag_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+
+          release_tag=""
+          if [[ -n "${INPUT_TAG:-}" ]]; then
+            release_tag="${INPUT_TAG}"
+          elif [[ -n "${RELEASE_EVENT_TAG:-}" ]]; then
+            release_tag="${RELEASE_EVENT_TAG}"
+          elif [[ "${REF_TYPE}" == "tag" && -n "${REF_NAME:-}" ]]; then
+            release_tag="${REF_NAME}"
+          fi
+
+          if [[ -z "${release_tag}" ]]; then
+            echo "release tag is required. Provide workflow_dispatch input 'tag' or run on tag push." >&2
+            exit 1
+          fi
+
+          if ! git rev-parse --verify --quiet "refs/tags/${release_tag}" >/dev/null; then
+            echo "tag refs/tags/${release_tag} not found." >&2
+            exit 1
+          fi
+
+          echo "tag=${release_tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Validate reusable workflows
+        id: validate
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          workflow_files=(.github/workflows/*.reusable.yml)
+          if [[ ${#workflow_files[@]} -eq 0 ]]; then
+            echo "no reusable workflows found under .github/workflows" >&2
+            exit 1
+          fi
+
+          checked_count=0
+          failed_count=0
+
+          for workflow_file in "${workflow_files[@]}"; do
+            checked_count=$((checked_count + 1))
+
+            has_workflow_call="false"
+            has_jobs="false"
+
+            if grep -Eq '^[[:space:]]*workflow_call:[[:space:]]*$' "${workflow_file}"; then
+              has_workflow_call="true"
+            fi
+
+            if grep -Eq '^[[:space:]]*jobs:[[:space:]]*$' "${workflow_file}"; then
+              has_jobs="true"
+            fi
+
+            if [[ "${has_workflow_call}" != "true" || "${has_jobs}" != "true" ]]; then
+              failed_count=$((failed_count + 1))
+              echo "::error file=${workflow_file}::missing required keys (workflow_call/jobs)"
+            fi
+          done
+
+          if command -v actionlint >/dev/null 2>&1; then
+            actionlint_bin="actionlint"
+          else
+            actionlint_version="1.7.10"
+            actionlint_archive="actionlint_${actionlint_version}_linux_amd64.tar.gz"
+            actionlint_url="https://github.com/rhysd/actionlint/releases/download/v${actionlint_version}/${actionlint_archive}"
+            tmp_dir="$(mktemp -d)"
+            trap 'rm -rf "${tmp_dir}"' EXIT
+
+            curl --fail --silent --show-error --location \
+              --output "${tmp_dir}/${actionlint_archive}" \
+              "${actionlint_url}"
+            tar -xzf "${tmp_dir}/${actionlint_archive}" -C "${tmp_dir}" actionlint
+            actionlint_bin="${tmp_dir}/actionlint"
+            chmod +x "${actionlint_bin}"
+          fi
+
+          "${actionlint_bin}" "${workflow_files[@]}"
+
+          echo "checked_count=${checked_count}" >> "${GITHUB_OUTPUT}"
+
+          if [[ "${failed_count}" -gt 0 ]]; then
+            echo "reusable workflow validation failed for ${failed_count} file(s)." >&2
+            exit 1
+          fi
+
+      - name: Build changelog summary
+        id: notes
+        env:
+          RELEASE_TAG: ${{ steps.release_tag.outputs.tag }}
+          CHECKED_COUNT: ${{ steps.validate.outputs.checked_count }}
+        run: |
+          set -euo pipefail
+
+          tag="${RELEASE_TAG}"
+          checked_count="${CHECKED_COUNT}"
+          notes_file="${RUNNER_TEMP}/release-summary.md"
+          workflow_pathspec=':(glob).github/workflows/*.reusable.yml'
+
+          current_sha="$(git rev-list -n 1 "${tag}")"
+          short_sha="$(printf '%s' "${current_sha}" | cut -c1-12)"
+
+          prev_tag=""
+          if git describe --tags --abbrev=0 "${tag}^" >/dev/null 2>&1; then
+            prev_tag="$(git describe --tags --abbrev=0 "${tag}^")"
+          fi
+
+          if [[ -n "${prev_tag}" ]]; then
+            mapfile -t changed_workflows < <(git diff --name-only "${prev_tag}" "${tag}" -- "${workflow_pathspec}" | sed '/^$/d')
+            commit_list="$(git log --pretty='- %s (`%h`)' "${prev_tag}..${tag}" | sed -n '1,60p')"
+          else
+            mapfile -t changed_workflows < <(git show --pretty='' --name-only "${tag}" -- "${workflow_pathspec}" | sed '/^$/d')
+            commit_list="$(git log --pretty='- %s (`%h`)' -n 30 "${tag}" | sed -n '1,60p')"
+          fi
+
+          {
+            echo "## Automated Validation"
+            echo
+            echo "- Reusable workflows checked: ${checked_count}"
+            echo "- Validation result: passed"
+            echo
+            echo "## Changelog Summary"
+            echo
+            echo "- Current tag: \`${tag}\`"
+            echo "- Current commit: \`${short_sha}\`"
+
+            if [[ -n "${prev_tag}" ]]; then
+              echo "- Previous tag: \`${prev_tag}\`"
+              echo "- Commit range: \`${prev_tag}..${tag}\`"
+            else
+              echo "- Previous tag: _none (first tagged release)_"
+              echo "- Commit range: \`${tag}\`"
+            fi
+
+            echo
+            echo "### Reusable Workflow Changes"
+            if [[ ${#changed_workflows[@]} -eq 0 ]]; then
+              echo "- No reusable workflow file changes detected in this release range."
+            else
+              for workflow_file in "${changed_workflows[@]}"; do
+                if [[ -n "${prev_tag}" ]]; then
+                  stat_line="$(git diff --numstat "${prev_tag}" "${tag}" -- "${workflow_file}" | awk 'NR==1 {print "+" $1 "/-" $2}')"
+                else
+                  stat_line="$(git show --numstat --pretty='' "${tag}" -- "${workflow_file}" | awk 'NR==1 {print "+" $1 "/-" $2}')"
+                fi
+
+                if [[ -z "${stat_line}" ]]; then
+                  stat_line="+0/-0"
+                fi
+
+                echo "- \`${workflow_file}\` (${stat_line})"
+              done
+            fi
+
+            echo
+            echo "### Commit Highlights"
+            if [[ -z "${commit_list}" ]]; then
+              echo "- No commits found for this release range."
+            else
+              printf '%s\n' "${commit_list}"
+            fi
+          } > "${notes_file}"
+
+          echo "notes_file=${notes_file}" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.release_tag.outputs.tag }}
+          NOTES_FILE: ${{ steps.notes.outputs.notes_file }}
+        run: |
+          set -euo pipefail
+
+          title="Release ${RELEASE_TAG}"
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            combined_notes="$(mktemp)"
+            existing_body="$(gh release view "${RELEASE_TAG}" --json body --jq '.body // ""')"
+
+            {
+              cat "${NOTES_FILE}"
+              if [[ -n "${existing_body}" ]]; then
+                echo
+                echo "---"
+                echo
+                printf '%s\n' "${existing_body}"
+              fi
+            } > "${combined_notes}"
+
+            gh release edit "${RELEASE_TAG}" --title "${title}" --notes-file "${combined_notes}"
+          else
+            gh release create "${RELEASE_TAG}" --title "${title}" --notes-file "${NOTES_FILE}" --generate-notes
+          fi
