@@ -236,6 +236,7 @@ jobs:
 
       - name: Attest build provenance
         if: ${{ inputs.push_image && steps.build.outputs.digest != '' }}
+        continue-on-error: true
         uses: actions/attest-build-provenance@v4
         with:
           subject-name: ${{ steps.tags.outputs.image_ref }}
