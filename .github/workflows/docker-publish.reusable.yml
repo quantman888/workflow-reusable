@@ -1,66 +1,99 @@
-name: Docker Publish Reusable
+name: Docker Publish Reusable Workflow
 
 on:
   workflow_call:
     inputs:
-      registry:
+      OCI_REGISTRY:
         description: "Docker registry host (for example: nexus.example.com)"
         required: true
         type: string
-      image_name:
+      OCI_IMAGE_NAME:
         description: "Image repository/name (for example: team/app)"
         required: true
         type: string
-      dockerfile_path:
+      OCI_DOCKERFILE_PATH:
         description: "Dockerfile path"
         required: false
         type: string
         default: "Dockerfile"
-      build_context:
+      OCI_BUILD_CONTEXT:
         description: "Docker build context"
         required: false
         type: string
         default: "."
-      target_platforms:
+      OCI_TARGET_PLATFORMS:
         description: "Target platforms"
         required: false
         type: string
         default: "linux/amd64"
-      build_args:
+      OCI_BUILD_ARGS:
         description: "Build args, newline-delimited KEY=VALUE entries"
         required: false
         type: string
         default: ""
-      push_image:
+      OCI_PUSH_IMAGE:
         description: "Whether to push image to registry"
         required: false
         type: boolean
         default: true
-      publish_channel:
+      OCI_PUBLISH_CHANNEL:
         description: "Publish channel: none|edge|release"
         required: false
         type: string
         default: "none"
-      release_version:
+      OCI_RELEASE_VERSION:
         description: "Release version for release channel (for example: 1.2.3 or 1.2.3-rc.1)"
         required: false
         type: string
         default: ""
-      publish_latest:
+      OCI_PUBLISH_LATEST:
         description: "Whether to publish latest tag for stable release only"
+        required: false
+        type: boolean
+        default: false
+      OCI_GATE_RUN_ARGS:
+        description: "Optional docker run args used by startup gate"
+        required: false
+        type: string
+        default: ""
+      OCI_GATE_HEALTH_URL:
+        description: "Optional health check URL for startup gate"
+        required: false
+        type: string
+        default: ""
+      OCI_GATE_SMOKE_CMD:
+        description: "Optional smoke command executed inside gate container"
+        required: false
+        type: string
+        default: ""
+      OCI_GATE_TIMEOUT_SECONDS:
+        description: "Startup/health gate timeout in seconds"
+        required: false
+        type: number
+        default: 60
+      OCI_GATE_VULN_SEVERITY:
+        description: "Vulnerability severities for Trivy scan"
+        required: false
+        type: string
+        default: "CRITICAL,HIGH"
+      OCI_GATE_VULN_IGNORE_UNFIXED:
+        description: "Ignore unfixed vulnerabilities in Trivy scan"
         required: false
         type: boolean
         default: false
     outputs:
       image_ref:
         description: "Fully qualified image reference without tag"
-        value: ${{ jobs.docker-publish.outputs.image_ref }}
+        value: ${{ jobs.docker_publish.outputs.image_ref }}
       image_tags:
         description: "Published image tags as comma-separated list"
-        value: ${{ jobs.docker-publish.outputs.image_tags }}
+        value: ${{ jobs.docker_publish.outputs.image_tags }}
       digest:
         description: "Image digest from docker/build-push-action"
-        value: ${{ jobs.docker-publish.outputs.digest }}
+        value: ${{ jobs.docker_publish.outputs.digest }}
+      image_with_digest:
+        description: "Image reference pinned by digest"
+        value: ${{ jobs.docker_publish.outputs.image_with_digest }}
     secrets:
       nexus_username:
         required: false
@@ -69,51 +102,81 @@ on:
 
   workflow_dispatch:
     inputs:
-      registry:
+      OCI_REGISTRY:
         description: "Docker registry host (for example: nexus.example.com)"
         required: true
         type: string
-      image_name:
+      OCI_IMAGE_NAME:
         description: "Image repository/name (for example: team/app)"
         required: true
         type: string
-      dockerfile_path:
+      OCI_DOCKERFILE_PATH:
         description: "Dockerfile path"
         required: false
         type: string
         default: "Dockerfile"
-      build_context:
+      OCI_BUILD_CONTEXT:
         description: "Docker build context"
         required: false
         type: string
         default: "."
-      target_platforms:
+      OCI_TARGET_PLATFORMS:
         description: "Target platforms"
         required: false
         type: string
         default: "linux/amd64"
-      build_args:
+      OCI_BUILD_ARGS:
         description: "Build args, newline-delimited KEY=VALUE entries"
         required: false
         type: string
         default: ""
-      push_image:
+      OCI_PUSH_IMAGE:
         description: "Whether to push image to registry"
         required: false
         type: boolean
         default: true
-      publish_channel:
+      OCI_PUBLISH_CHANNEL:
         description: "Publish channel: none|edge|release"
         required: false
         type: string
         default: "none"
-      release_version:
+      OCI_RELEASE_VERSION:
         description: "Release version for release channel (for example: 1.2.3 or 1.2.3-rc.1)"
         required: false
         type: string
         default: ""
-      publish_latest:
+      OCI_PUBLISH_LATEST:
         description: "Whether to publish latest tag for stable release only"
+        required: false
+        type: boolean
+        default: false
+      OCI_GATE_RUN_ARGS:
+        description: "Optional docker run args used by startup gate"
+        required: false
+        type: string
+        default: ""
+      OCI_GATE_HEALTH_URL:
+        description: "Optional health check URL for startup gate"
+        required: false
+        type: string
+        default: ""
+      OCI_GATE_SMOKE_CMD:
+        description: "Optional smoke command executed inside gate container"
+        required: false
+        type: string
+        default: ""
+      OCI_GATE_TIMEOUT_SECONDS:
+        description: "Startup/health gate timeout in seconds"
+        required: false
+        type: number
+        default: 60
+      OCI_GATE_VULN_SEVERITY:
+        description: "Vulnerability severities for Trivy scan"
+        required: false
+        type: string
+        default: "CRITICAL,HIGH"
+      OCI_GATE_VULN_IGNORE_UNFIXED:
+        description: "Ignore unfixed vulnerabilities in Trivy scan"
         required: false
         type: boolean
         default: false
@@ -122,12 +185,14 @@ permissions:
   contents: read
 
 jobs:
-  docker-publish:
+  docker_publish:
+    name: Build And Publish OCI Image
     runs-on: ubuntu-latest
     outputs:
       image_ref: ${{ steps.tags.outputs.image_ref }}
       image_tags: ${{ steps.tags.outputs.image_tags }}
       digest: ${{ steps.build.outputs.digest }}
+      image_with_digest: ${{ steps.final_ref.outputs.image_with_digest }}
     defaults:
       run:
         shell: bash
@@ -138,22 +203,22 @@ jobs:
       - name: Resolve image tags
         id: tags
         env:
-          REGISTRY: ${{ inputs.registry }}
-          IMAGE_NAME: ${{ inputs.image_name }}
-          PUBLISH_CHANNEL: ${{ inputs.publish_channel }}
-          RELEASE_VERSION: ${{ inputs.release_version }}
-          PUBLISH_LATEST: ${{ inputs.publish_latest }}
+          OCI_REGISTRY: ${{ inputs.OCI_REGISTRY }}
+          OCI_IMAGE_NAME: ${{ inputs.OCI_IMAGE_NAME }}
+          OCI_PUBLISH_CHANNEL: ${{ inputs.OCI_PUBLISH_CHANNEL }}
+          OCI_RELEASE_VERSION: ${{ inputs.OCI_RELEASE_VERSION }}
+          OCI_PUBLISH_LATEST: ${{ inputs.OCI_PUBLISH_LATEST }}
           GITHUB_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
 
-          image_ref="${REGISTRY%/}/${IMAGE_NAME}"
+          image_ref="${OCI_REGISTRY%/}/${OCI_IMAGE_NAME}"
           short_sha="${GITHUB_SHA:0:12}"
           sha_tag="sha-${short_sha}"
 
           tags=("${image_ref}:${sha_tag}")
-          channel="${PUBLISH_CHANNEL:-none}"
-          release_version="${RELEASE_VERSION:-}"
+          channel="${OCI_PUBLISH_CHANNEL:-none}"
+          release_version="${OCI_RELEASE_VERSION:-}"
           stable_release="false"
 
           case "${channel}" in
@@ -164,12 +229,12 @@ jobs:
               ;;
             release)
               if [[ -z "${release_version}" ]]; then
-                echo "release_version is required when publish_channel=release" >&2
+                echo "OCI_RELEASE_VERSION is required when OCI_PUBLISH_CHANNEL=release" >&2
                 exit 1
               fi
               normalized_version="${release_version#v}"
               if [[ ! "${normalized_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
-                echo "invalid release_version: ${release_version}" >&2
+                echo "invalid OCI_RELEASE_VERSION: ${release_version}" >&2
                 exit 1
               fi
               tags+=("${image_ref}:${normalized_version}")
@@ -182,12 +247,12 @@ jobs:
               fi
               ;;
             *)
-              echo "invalid publish_channel: ${channel} (allowed: none|edge|release)" >&2
+              echo "invalid OCI_PUBLISH_CHANNEL: ${channel} (allowed: none|edge|release)" >&2
               exit 1
               ;;
           esac
 
-          if [[ "${PUBLISH_LATEST}" == "true" && "${stable_release}" == "true" ]]; then
+          if [[ "${OCI_PUBLISH_LATEST}" == "true" && "${stable_release}" == "true" ]]; then
             tags+=("${image_ref}:latest")
           fi
 
@@ -213,10 +278,10 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Login to Nexus registry
-        if: ${{ inputs.push_image }}
+        if: ${{ inputs.OCI_PUSH_IMAGE }}
         uses: docker/login-action@v3
         with:
-          registry: ${{ inputs.registry }}
+          registry: ${{ inputs.OCI_REGISTRY }}
           username: ${{ secrets.nexus_username }}
           password: ${{ secrets.nexus_password }}
 
@@ -224,9 +289,129 @@ jobs:
         id: build
         uses: docker/build-push-action@v6
         with:
-          context: ${{ inputs.build_context }}
-          file: ${{ inputs.dockerfile_path }}
-          platforms: ${{ inputs.target_platforms }}
-          push: ${{ inputs.push_image }}
+          context: ${{ inputs.OCI_BUILD_CONTEXT }}
+          file: ${{ inputs.OCI_DOCKERFILE_PATH }}
+          platforms: ${{ inputs.OCI_TARGET_PLATFORMS }}
+          push: ${{ inputs.OCI_PUSH_IMAGE }}
           tags: ${{ steps.tags.outputs.tags }}
-          build-args: ${{ inputs.build_args }}
+          build-args: ${{ inputs.OCI_BUILD_ARGS }}
+
+      - name: Resolve digest reference
+        id: final_ref
+        env:
+          IMAGE_REF: ${{ steps.tags.outputs.image_ref }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${DIGEST}" ]]; then
+            echo "image_with_digest=${IMAGE_REF}@${DIGEST}" >> "${GITHUB_OUTPUT}"
+          else
+            echo "image_with_digest=" >> "${GITHUB_OUTPUT}"
+          fi
+
+  image_gate:
+    name: OCI Middle-Ring Gate
+    runs-on: ubuntu-latest
+    needs: docker_publish
+    if: ${{ inputs.OCI_PUSH_IMAGE && needs.docker_publish.outputs.image_with_digest != '' }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Pull image by digest
+        env:
+          IMAGE_WITH_DIGEST: ${{ needs.docker_publish.outputs.image_with_digest }}
+        run: |
+          set -euo pipefail
+          docker pull "${IMAGE_WITH_DIGEST}"
+
+      - name: Startup gate
+        id: startup
+        env:
+          IMAGE_WITH_DIGEST: ${{ needs.docker_publish.outputs.image_with_digest }}
+          OCI_GATE_RUN_ARGS: ${{ inputs.OCI_GATE_RUN_ARGS }}
+          OCI_GATE_TIMEOUT_SECONDS: ${{ inputs.OCI_GATE_TIMEOUT_SECONDS }}
+        run: |
+          set -euo pipefail
+
+          container_name="oci-gate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          timeout_seconds="${OCI_GATE_TIMEOUT_SECONDS:-60}"
+
+          if [[ -n "${OCI_GATE_RUN_ARGS}" ]]; then
+            read -r -a run_args <<< "${OCI_GATE_RUN_ARGS}"
+          else
+            run_args=()
+          fi
+
+          docker run -d --name "${container_name}" "${run_args[@]}" "${IMAGE_WITH_DIGEST}" >/dev/null
+
+          start_epoch="$(date +%s)"
+          while true; do
+            status="$(docker inspect -f '{{.State.Status}}' "${container_name}" 2>/dev/null || true)"
+            case "${status}" in
+              running)
+                break
+                ;;
+              exited|dead)
+                docker logs "${container_name}" || true
+                echo "container ${container_name} terminated during startup" >&2
+                exit 1
+                ;;
+            esac
+
+            now_epoch="$(date +%s)"
+            if (( now_epoch - start_epoch >= timeout_seconds )); then
+              docker logs "${container_name}" || true
+              echo "container ${container_name} did not reach running state within ${timeout_seconds}s" >&2
+              exit 1
+            fi
+            sleep 2
+          done
+
+          echo "container_name=${container_name}" >> "${GITHUB_OUTPUT}"
+
+      - name: Optional health URL check
+        if: ${{ inputs.OCI_GATE_HEALTH_URL != '' }}
+        env:
+          OCI_GATE_HEALTH_URL: ${{ inputs.OCI_GATE_HEALTH_URL }}
+          OCI_GATE_TIMEOUT_SECONDS: ${{ inputs.OCI_GATE_TIMEOUT_SECONDS }}
+        run: |
+          set -euo pipefail
+
+          timeout_seconds="${OCI_GATE_TIMEOUT_SECONDS:-60}"
+          start_epoch="$(date +%s)"
+          until curl -fsS "${OCI_GATE_HEALTH_URL}" >/dev/null; do
+            now_epoch="$(date +%s)"
+            if (( now_epoch - start_epoch >= timeout_seconds )); then
+              echo "health check timeout: ${OCI_GATE_HEALTH_URL}" >&2
+              exit 1
+            fi
+            sleep 2
+          done
+
+      - name: Optional smoke command
+        if: ${{ inputs.OCI_GATE_SMOKE_CMD != '' }}
+        env:
+          CONTAINER_NAME: ${{ steps.startup.outputs.container_name }}
+          OCI_GATE_SMOKE_CMD: ${{ inputs.OCI_GATE_SMOKE_CMD }}
+        run: |
+          set -euo pipefail
+          docker exec "${CONTAINER_NAME}" sh -lc "${OCI_GATE_SMOKE_CMD}"
+
+      - name: Vulnerability scan
+        uses: aquasecurity/trivy-action@0.31.0
+        with:
+          image-ref: ${{ needs.docker_publish.outputs.image_with_digest }}
+          format: table
+          exit-code: '1'
+          ignore-unfixed: ${{ inputs.OCI_GATE_VULN_IGNORE_UNFIXED }}
+          severity: ${{ inputs.OCI_GATE_VULN_SEVERITY }}
+
+      - name: Cleanup gate container
+        if: ${{ always() && steps.startup.outputs.container_name != '' }}
+        env:
+          CONTAINER_NAME: ${{ steps.startup.outputs.container_name }}
+        run: |
+          set -euo pipefail
+          docker logs "${CONTAINER_NAME}" || true
+          docker rm -f "${CONTAINER_NAME}" || true
