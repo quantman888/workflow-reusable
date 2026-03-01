@@ -1,0 +1,121 @@
+name: Fork Sync Reusable
+
+on:
+  workflow_call:
+    inputs:
+      target_branch:
+        description: "Fork target branch"
+        required: false
+        type: string
+        default: "main"
+      upstream_repo:
+        description: "Upstream repository in owner/repo format"
+        required: true
+        type: string
+      upstream_branch:
+        description: "Upstream branch to sync from"
+        required: false
+        type: string
+        default: "main"
+    outputs:
+      needs_sync:
+        description: "Whether target branch differs from upstream branch"
+        value: ${{ jobs.fork_sync.outputs.needs_sync }}
+      local_sha:
+        description: "Current local target branch SHA"
+        value: ${{ jobs.fork_sync.outputs.local_sha }}
+      upstream_sha:
+        description: "Current upstream branch SHA"
+        value: ${{ jobs.fork_sync.outputs.upstream_sha }}
+      synced:
+        description: "Whether this run performed sync merge and push"
+        value: ${{ jobs.fork_sync.outputs.synced }}
+
+permissions:
+  contents: write
+
+jobs:
+  fork_sync:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      needs_sync: ${{ steps.compare.outputs.needs_sync }}
+      local_sha: ${{ steps.compare.outputs.local_sha }}
+      upstream_sha: ${{ steps.compare.outputs.upstream_sha }}
+      synced: ${{ steps.finalize.outputs.synced }}
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_branch }}
+          fetch-depth: 0
+
+      - name: Configure git user
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Configure upstream remote
+        run: |
+          set -euo pipefail
+          upstream_repo="${{ inputs.upstream_repo }}"
+
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote remove upstream
+          fi
+
+          git remote add upstream "https://github.com/${upstream_repo}.git"
+
+      - name: Fetch upstream branch
+        run: |
+          set -euo pipefail
+          upstream_branch="${{ inputs.upstream_branch }}"
+          git fetch --no-tags upstream "${upstream_branch}"
+
+      - name: Compare branch SHAs
+        id: compare
+        run: |
+          set -euo pipefail
+          upstream_branch="${{ inputs.upstream_branch }}"
+          local_sha="$(git rev-parse HEAD)"
+          upstream_sha="$(git rev-parse "upstream/${upstream_branch}")"
+
+          if [[ "${local_sha}" == "${upstream_sha}" ]]; then
+            needs_sync="false"
+          else
+            needs_sync="true"
+          fi
+
+          {
+            echo "needs_sync=${needs_sync}"
+            echo "local_sha=${local_sha}"
+            echo "upstream_sha=${upstream_sha}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Sync target branch from upstream
+        id: sync
+        if: ${{ steps.compare.outputs.needs_sync == 'true' }}
+        run: |
+          set -euo pipefail
+          target_branch="${{ inputs.target_branch }}"
+          upstream_branch="${{ inputs.upstream_branch }}"
+
+          git merge --ff-only "upstream/${upstream_branch}"
+          git push origin "HEAD:${target_branch}"
+
+      - name: Finalize outputs
+        id: finalize
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          needs_sync="${{ steps.compare.outputs.needs_sync }}"
+          sync_outcome="${{ steps.sync.outcome }}"
+
+          if [[ "${needs_sync}" == "true" && "${sync_outcome}" == "success" ]]; then
+            echo "synced=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "synced=false" >> "${GITHUB_OUTPUT}"
+          fi

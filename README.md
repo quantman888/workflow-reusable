@@ -106,3 +106,73 @@ jobs:
       nexus_username: ${{ secrets.NEXUS_USERNAME }}
       nexus_password: ${{ secrets.NEXUS_PASSWORD }}
 ```
+
+## 7. Fork Sync Reusable
+
+文件：`.github/workflows/fork-sync.reusable.yml`  
+用途：将 fork 的目标分支与上游分支做快进同步（仅允许 `--ff-only`）。
+
+### Inputs 说明
+
+| 名称 | 类型 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- |
+| `target_branch` | `string` | 否 | `main` | 当前仓库要同步的目标分支 |
+| `upstream_repo` | `string` | 是 | 无 | 上游仓库，格式 `owner/repo` |
+| `upstream_branch` | `string` | 否 | `main` | 上游分支 |
+
+### Outputs 说明
+
+| 名称 | 类型 | 说明 |
+| --- | --- | --- |
+| `needs_sync` | `string` | 本地与上游 SHA 是否不同（`true/false`） |
+| `local_sha` | `string` | 本地目标分支 SHA |
+| `upstream_sha` | `string` | 上游分支 SHA |
+| `synced` | `string` | 是否执行并完成同步推送（`true/false`） |
+
+### 调用示例（caller）
+
+```yaml
+jobs:
+  sync-main:
+    uses: <owner>/workflow-reusable/.github/workflows/fork-sync.reusable.yml@main
+    with:
+      target_branch: main
+      upstream_repo: upstream-owner/upstream-repo
+      upstream_branch: main
+```
+
+## 8. Branch Sync PR Reusable
+
+文件：`.github/workflows/branch-sync-pr.reusable.yml`  
+用途：比较 `target..source` 提交差异；有新增时检查是否已有 open PR，无则自动创建。
+
+### Inputs 说明
+
+| 名称 | 类型 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- |
+| `source_branch` | `string` | 否 | `main` | PR head 分支 |
+| `target_branch` | `string` | 否 | `custom/docker` | PR base 分支 |
+| `pr_title` | `string` | 否 | `chore(sync): merge main into custom/docker` | PR 标题 |
+| `pr_body` | `string` | 否 | 自动说明文本 | PR 描述 |
+
+### Outputs 说明
+
+| 名称 | 类型 | 说明 |
+| --- | --- | --- |
+| `has_new_commits` | `string` | source 是否有 target 没有的新提交 |
+| `pr_exists` | `string` | 是否已存在 open PR（base=target, head=`owner:source`） |
+| `pr_created` | `string` | 本次是否新建 PR |
+| `pr_url` | `string` | 已有或新建 PR 的 URL |
+
+### 调用示例（caller）
+
+```yaml
+jobs:
+  open-sync-pr:
+    uses: <owner>/workflow-reusable/.github/workflows/branch-sync-pr.reusable.yml@main
+    with:
+      source_branch: main
+      target_branch: custom/docker
+      pr_title: "chore(sync): merge main into custom/docker"
+      pr_body: "自动同步分支变更并创建 PR。"
+```

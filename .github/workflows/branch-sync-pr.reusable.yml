@@ -1,0 +1,117 @@
+name: Branch Sync PR Reusable
+
+on:
+  workflow_call:
+    inputs:
+      source_branch:
+        description: "Source branch (head)"
+        required: false
+        type: string
+        default: "main"
+      target_branch:
+        description: "Target branch (base)"
+        required: false
+        type: string
+        default: "custom/docker"
+      pr_title:
+        description: "Pull request title"
+        required: false
+        type: string
+        default: "chore(sync): merge main into custom/docker"
+      pr_body:
+        description: "Pull request body"
+        required: false
+        type: string
+        default: "自动同步分支变更并创建 PR。"
+    outputs:
+      has_new_commits:
+        description: "Whether source has commits not in target"
+        value: ${{ jobs.open_branch_pr.outputs.has_new_commits }}
+      pr_exists:
+        description: "Whether an open PR already exists"
+        value: ${{ jobs.open_branch_pr.outputs.pr_exists }}
+      pr_created:
+        description: "Whether a new PR was created in this run"
+        value: ${{ jobs.open_branch_pr.outputs.pr_created }}
+      pr_url:
+        description: "Existing or newly created PR URL"
+        value: ${{ jobs.open_branch_pr.outputs.pr_url }}
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  open_branch_pr:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      has_new_commits: ${{ steps.pr.outputs.has_new_commits }}
+      pr_exists: ${{ steps.pr.outputs.pr_exists }}
+      pr_created: ${{ steps.pr.outputs.pr_created }}
+      pr_url: ${{ steps.pr.outputs.pr_url }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch source and target branches
+        run: |
+          set -euo pipefail
+          source_branch="${{ inputs.source_branch }}"
+          target_branch="${{ inputs.target_branch }}"
+
+          git fetch --no-tags origin \
+            "refs/heads/${source_branch}:refs/remotes/origin/${source_branch}" \
+            "refs/heads/${target_branch}:refs/remotes/origin/${target_branch}"
+
+      - name: Check commits and open/create PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          source_branch="${{ inputs.source_branch }}"
+          target_branch="${{ inputs.target_branch }}"
+          repo_owner="${{ github.repository_owner }}"
+          pr_title="${{ inputs.pr_title }}"
+          pr_body="${{ inputs.pr_body }}"
+
+          has_new_commits="false"
+          pr_exists="false"
+          pr_created="false"
+          pr_url=""
+
+          commit_count="$(git rev-list --count "origin/${target_branch}..origin/${source_branch}")"
+          if [[ "${commit_count}" -gt 0 ]]; then
+            has_new_commits="true"
+
+            existing_pr_url="$(gh pr list \
+              --state open \
+              --base "${target_branch}" \
+              --head "${repo_owner}:${source_branch}" \
+              --json url \
+              --jq '.[0].url // ""')"
+
+            if [[ -n "${existing_pr_url}" ]]; then
+              pr_exists="true"
+              pr_url="${existing_pr_url}"
+            else
+              pr_url="$(gh pr create \
+                --base "${target_branch}" \
+                --head "${repo_owner}:${source_branch}" \
+                --title "${pr_title}" \
+                --body "${pr_body}")"
+              pr_created="true"
+            fi
+          fi
+
+          {
+            echo "has_new_commits=${has_new_commits}"
+            echo "pr_exists=${pr_exists}"
+            echo "pr_created=${pr_created}"
+            echo "pr_url=${pr_url}"
+          } >> "${GITHUB_OUTPUT}"
