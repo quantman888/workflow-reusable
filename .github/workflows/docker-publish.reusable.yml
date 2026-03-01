@@ -120,9 +120,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write
-  attestations: write
-  artifact-metadata: write
 
 jobs:
   docker-publish:
@@ -233,12 +230,3 @@ jobs:
           push: ${{ inputs.push_image }}
           tags: ${{ steps.tags.outputs.tags }}
           build-args: ${{ inputs.build_args }}
-
-      - name: Attest build provenance
-        if: ${{ inputs.push_image && steps.build.outputs.digest != '' }}
-        continue-on-error: true
-        uses: actions/attest-build-provenance@v4
-        with:
-          subject-name: ${{ steps.tags.outputs.image_ref }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
