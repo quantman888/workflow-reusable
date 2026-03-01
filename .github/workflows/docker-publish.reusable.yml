@@ -31,16 +31,41 @@ on:
         required: false
         type: string
         default: ""
-      publish_latest:
-        description: "Whether to publish latest on main/workflow_dispatch"
+      push_image:
+        description: "Whether to push image to registry"
         required: false
         type: boolean
         default: true
+      publish_channel:
+        description: "Publish channel: none|edge|release"
+        required: false
+        type: string
+        default: "none"
+      release_version:
+        description: "Release version for release channel (for example: 1.2.3 or 1.2.3-rc.1)"
+        required: false
+        type: string
+        default: ""
+      publish_latest:
+        description: "Whether to publish latest tag for stable release only"
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      image_ref:
+        description: "Fully qualified image reference without tag"
+        value: ${{ jobs.docker-publish.outputs.image_ref }}
+      image_tags:
+        description: "Published image tags as comma-separated list"
+        value: ${{ jobs.docker-publish.outputs.image_tags }}
+      digest:
+        description: "Image digest from docker/build-push-action"
+        value: ${{ jobs.docker-publish.outputs.digest }}
     secrets:
       nexus_username:
-        required: true
+        required: false
       nexus_password:
-        required: true
+        required: false
 
   workflow_dispatch:
     inputs:
@@ -72,18 +97,40 @@ on:
         required: false
         type: string
         default: ""
-      publish_latest:
-        description: "Whether to publish latest on main/workflow_dispatch"
+      push_image:
+        description: "Whether to push image to registry"
         required: false
         type: boolean
         default: true
+      publish_channel:
+        description: "Publish channel: none|edge|release"
+        required: false
+        type: string
+        default: "none"
+      release_version:
+        description: "Release version for release channel (for example: 1.2.3 or 1.2.3-rc.1)"
+        required: false
+        type: string
+        default: ""
+      publish_latest:
+        description: "Whether to publish latest tag for stable release only"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
 
 jobs:
   docker-publish:
     runs-on: ubuntu-latest
+    outputs:
+      image_ref: ${{ steps.tags.outputs.image_ref }}
+      image_tags: ${{ steps.tags.outputs.image_tags }}
+      digest: ${{ steps.build.outputs.digest }}
     defaults:
       run:
         shell: bash
@@ -96,40 +143,80 @@ jobs:
         env:
           REGISTRY: ${{ inputs.registry }}
           IMAGE_NAME: ${{ inputs.image_name }}
+          PUBLISH_CHANNEL: ${{ inputs.publish_channel }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
           PUBLISH_LATEST: ${{ inputs.publish_latest }}
-          GITHUB_REF: ${{ github.ref }}
           GITHUB_SHA: ${{ github.sha }}
-          GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
 
           image_ref="${REGISTRY%/}/${IMAGE_NAME}"
-          short_sha="${GITHUB_SHA:0:7}"
+          short_sha="${GITHUB_SHA:0:12}"
           sha_tag="sha-${short_sha}"
 
           tags=("${image_ref}:${sha_tag}")
+          channel="${PUBLISH_CHANNEL:-none}"
+          release_version="${RELEASE_VERSION:-}"
+          stable_release="false"
 
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            release_tag="${GITHUB_REF#refs/tags/}"
-            tags+=("${image_ref}:${release_tag}")
+          case "${channel}" in
+            none)
+              ;;
+            edge)
+              tags+=("${image_ref}:edge")
+              ;;
+            release)
+              if [[ -z "${release_version}" ]]; then
+                echo "release_version is required when publish_channel=release" >&2
+                exit 1
+              fi
+              normalized_version="${release_version#v}"
+              if [[ ! "${normalized_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+                echo "invalid release_version: ${release_version}" >&2
+                exit 1
+              fi
+              tags+=("${image_ref}:${normalized_version}")
+              if [[ "${normalized_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                stable_release="true"
+                major_minor="${normalized_version%.*}"
+                major="${major_minor%%.*}"
+                tags+=("${image_ref}:${major_minor}")
+                tags+=("${image_ref}:${major}")
+              fi
+              ;;
+            *)
+              echo "invalid publish_channel: ${channel} (allowed: none|edge|release)" >&2
+              exit 1
+              ;;
+          esac
+
+          if [[ "${PUBLISH_LATEST}" == "true" && "${stable_release}" == "true" ]]; then
+            tags+=("${image_ref}:latest")
           fi
 
-          if [[ "${PUBLISH_LATEST}" == "true" ]]; then
-            if [[ "${GITHUB_REF}" == "refs/heads/main" || "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-              tags+=("${image_ref}:latest")
+          image_tags_csv=""
+          for full_tag in "${tags[@]}"; do
+            tag="${full_tag#${image_ref}:}"
+            if [[ -z "${image_tags_csv}" ]]; then
+              image_tags_csv="${tag}"
+            else
+              image_tags_csv="${image_tags_csv},${tag}"
             fi
-          fi
+          done
 
           {
             echo "tags<<EOF"
             printf '%s\n' "${tags[@]}"
             echo "EOF"
+            echo "image_ref=${image_ref}"
+            echo "image_tags=${image_tags_csv}"
           } >> "${GITHUB_OUTPUT}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Login to Nexus registry
+        if: ${{ inputs.push_image }}
         uses: docker/login-action@v3
         with:
           registry: ${{ inputs.registry }}
@@ -137,11 +224,20 @@ jobs:
           password: ${{ secrets.nexus_password }}
 
       - name: Build and push image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: ${{ inputs.build_context }}
           file: ${{ inputs.dockerfile_path }}
           platforms: ${{ inputs.target_platforms }}
-          push: true
+          push: ${{ inputs.push_image }}
           tags: ${{ steps.tags.outputs.tags }}
           build-args: ${{ inputs.build_args }}
+
+      - name: Attest build provenance
+        if: ${{ inputs.push_image && steps.build.outputs.digest != '' }}
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ steps.tags.outputs.image_ref }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
