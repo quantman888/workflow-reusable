@@ -318,6 +318,14 @@ jobs:
       run:
         shell: bash
     steps:
+      - name: Login to OCI registry
+        if: ${{ inputs.OCI_PUSH_IMAGE }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.OCI_REGISTRY }}
+          username: ${{ secrets.nexus_username }}
+          password: ${{ secrets.nexus_password }}
+
       - name: Pull image by digest
         env:
           IMAGE_WITH_DIGEST: ${{ needs.docker_publish.outputs.image_with_digest }}
