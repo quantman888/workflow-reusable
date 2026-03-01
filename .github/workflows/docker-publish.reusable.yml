@@ -407,13 +407,31 @@ jobs:
           docker exec "${CONTAINER_NAME}" sh -lc "${OCI_GATE_SMOKE_CMD}"
 
       - name: Vulnerability scan
-        uses: aquasecurity/trivy-action@0.31.0
-        with:
-          image-ref: ${{ needs.docker_publish.outputs.image_with_digest }}
-          format: table
-          exit-code: '1'
-          ignore-unfixed: ${{ inputs.OCI_GATE_VULN_IGNORE_UNFIXED }}
-          severity: ${{ inputs.OCI_GATE_VULN_SEVERITY }}
+        env:
+          IMAGE_WITH_DIGEST: ${{ needs.docker_publish.outputs.image_with_digest }}
+          OCI_GATE_VULN_SEVERITY: ${{ inputs.OCI_GATE_VULN_SEVERITY }}
+          OCI_GATE_VULN_IGNORE_UNFIXED: ${{ inputs.OCI_GATE_VULN_IGNORE_UNFIXED }}
+        run: |
+          set -euo pipefail
+
+          trivy_image="aquasec/trivy:latest"
+          scan_args=(
+            image
+            --scanners vuln
+            --format table
+            --exit-code 1
+            --severity "${OCI_GATE_VULN_SEVERITY}"
+          )
+
+          if [[ "${OCI_GATE_VULN_IGNORE_UNFIXED}" == "true" ]]; then
+            scan_args+=(--ignore-unfixed)
+          fi
+
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            "${trivy_image}" \
+            "${scan_args[@]}" \
+            "${IMAGE_WITH_DIGEST}"
 
       - name: Cleanup gate container
         if: ${{ always() && steps.startup.outputs.container_name != '' }}
