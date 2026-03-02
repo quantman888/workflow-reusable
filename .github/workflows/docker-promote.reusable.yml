@@ -1,0 +1,300 @@
+name: Docker Promote Reusable Workflow
+
+on:
+  workflow_call:
+    inputs:
+      OCI_REGISTRY:
+        description: "Docker registry host (for example: nexus.example.com)"
+        required: true
+        type: string
+      OCI_IMAGE_NAME:
+        description: "Image repository/name (for example: team/app)"
+        required: true
+        type: string
+      OCI_RELEASE_VERSION:
+        description: "Release version to promote to (supports v1.2.3, 1.2.3, 1.2.3-rc.1)"
+        required: true
+        type: string
+      OCI_SOURCE_TAG:
+        description: "Source tag used to resolve digest before retag"
+        required: false
+        type: string
+        default: "edge"
+      OCI_PUBLISH_LATEST:
+        description: "Whether to additionally promote latest for stable release"
+        required: false
+        type: boolean
+        default: true
+      OCI_EXTRA_TARGET_TAGS:
+        description: "Optional extra target tags (newline/comma/semicolon separated)"
+        required: false
+        type: string
+        default: ""
+      OCI_PROMOTE_DRY_RUN:
+        description: "Validate and print promotion plan without mutating tags"
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      image_ref:
+        description: "Fully qualified image reference without tag"
+        value: ${{ jobs.docker_promote.outputs.image_ref }}
+      digest:
+        description: "Resolved digest from source tag"
+        value: ${{ jobs.docker_promote.outputs.digest }}
+      image_with_digest:
+        description: "Image pinned by digest"
+        value: ${{ jobs.docker_promote.outputs.image_with_digest }}
+      source_ref:
+        description: "Source image reference used to resolve digest"
+        value: ${{ jobs.docker_promote.outputs.source_ref }}
+      source_tag:
+        description: "Source tag used for digest resolution"
+        value: ${{ jobs.docker_promote.outputs.source_tag }}
+      release_version:
+        description: "Normalized release version without leading v"
+        value: ${{ jobs.docker_promote.outputs.release_version }}
+      promoted_tags:
+        description: "Promoted tags as comma-separated list"
+        value: ${{ jobs.docker_promote.outputs.promoted_tags }}
+      promoted_refs:
+        description: "Promoted refs as comma-separated list"
+        value: ${{ jobs.docker_promote.outputs.promoted_refs }}
+      promoted_count:
+        description: "Number of promoted tags"
+        value: ${{ jobs.docker_promote.outputs.promoted_count }}
+    secrets:
+      registry_username:
+        required: false
+      registry_password:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  docker_promote:
+    name: Promote OCI Image Tags By Digest
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: docker-promote-${{ github.repository }}-${{ inputs.OCI_REGISTRY }}-${{ inputs.OCI_IMAGE_NAME }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      image_ref: ${{ steps.resolve.outputs.image_ref }}
+      digest: ${{ steps.resolve.outputs.digest }}
+      image_with_digest: ${{ steps.resolve.outputs.image_with_digest }}
+      source_ref: ${{ steps.resolve.outputs.source_ref }}
+      source_tag: ${{ steps.resolve.outputs.source_tag }}
+      release_version: ${{ steps.resolve.outputs.release_version }}
+      promoted_tags: ${{ steps.resolve.outputs.promoted_tags }}
+      promoted_refs: ${{ steps.resolve.outputs.promoted_refs }}
+      promoted_count: ${{ steps.promote.outputs.promoted_count }}
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Login to OCI registry
+        if: ${{ env.REGISTRY_USERNAME != '' && env.REGISTRY_PASSWORD != '' }}
+        env:
+          REGISTRY_USERNAME: ${{ secrets.registry_username }}
+          REGISTRY_PASSWORD: ${{ secrets.registry_password }}
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ inputs.OCI_REGISTRY }}
+          username: ${{ secrets.registry_username }}
+          password: ${{ secrets.registry_password }}
+
+      - name: Resolve promotion targets
+        id: resolve
+        env:
+          OCI_REGISTRY: ${{ inputs.OCI_REGISTRY }}
+          OCI_IMAGE_NAME: ${{ inputs.OCI_IMAGE_NAME }}
+          OCI_RELEASE_VERSION: ${{ inputs.OCI_RELEASE_VERSION }}
+          OCI_SOURCE_TAG: ${{ inputs.OCI_SOURCE_TAG }}
+          OCI_PUBLISH_LATEST: ${{ inputs.OCI_PUBLISH_LATEST }}
+          OCI_EXTRA_TARGET_TAGS: ${{ inputs.OCI_EXTRA_TARGET_TAGS }}
+          OCI_PROMOTE_DRY_RUN: ${{ inputs.OCI_PROMOTE_DRY_RUN }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${OCI_REGISTRY:-}" || -z "${OCI_IMAGE_NAME:-}" ]]; then
+            echo "OCI_REGISTRY and OCI_IMAGE_NAME are required."
+            exit 1
+          fi
+
+          image_ref="${OCI_REGISTRY%/}/${OCI_IMAGE_NAME#/}"
+          raw_version="${OCI_RELEASE_VERSION:-}"
+          source_tag="${OCI_SOURCE_TAG:-edge}"
+          publish_latest="$(printf '%s' "${OCI_PUBLISH_LATEST:-true}" | awk '{print tolower($0)}')"
+          promote_dry_run="$(printf '%s' "${OCI_PROMOTE_DRY_RUN:-false}" | awk '{print tolower($0)}')"
+
+          if [[ "${publish_latest}" != "true" ]]; then
+            publish_latest="false"
+          fi
+          if [[ "${promote_dry_run}" != "true" ]]; then
+            promote_dry_run="false"
+          fi
+
+          if [[ -z "${raw_version}" ]]; then
+            echo "OCI_RELEASE_VERSION is required."
+            exit 1
+          fi
+
+          version="${raw_version#v}"
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "invalid OCI_RELEASE_VERSION: ${raw_version}"
+            exit 1
+          fi
+
+          if [[ -z "${source_tag}" ]]; then
+            echo "OCI_SOURCE_TAG is required."
+            exit 1
+          fi
+          if [[ ! "${source_tag}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "invalid OCI_SOURCE_TAG: ${source_tag}"
+            exit 1
+          fi
+
+          source_ref="${image_ref}:${source_tag}"
+          inspect_output="$(docker buildx imagetools inspect "${source_ref}" 2>&1 || true)"
+          digest="$(printf '%s\n' "${inspect_output}" | sed -nE 's/^[[:space:]]*Digest:[[:space:]]*(sha256:[0-9A-Fa-f]{64}).*$/\1/p' | head -n1 || true)"
+          if [[ -z "${digest}" ]]; then
+            echo "failed to resolve digest from source ref: ${source_ref}"
+            printf '%s\n' "${inspect_output}"
+            exit 1
+          fi
+          image_with_digest="${image_ref}@${digest}"
+
+          tags=("${version}")
+          stable_release="false"
+          if [[ "${version}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            stable_release="true"
+            major="${BASH_REMATCH[1]}"
+            major_minor="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+            tags+=("${major_minor}" "${major}")
+          fi
+
+          if [[ "${publish_latest}" == "true" && "${stable_release}" == "true" ]]; then
+            tags+=("latest")
+          fi
+
+          if [[ -n "${OCI_EXTRA_TARGET_TAGS:-}" ]]; then
+            while IFS= read -r raw_tag; do
+              tag="$(printf '%s' "${raw_tag}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+              if [[ -z "${tag}" ]]; then
+                continue
+              fi
+              if [[ ! "${tag}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+                echo "invalid extra target tag: ${tag}"
+                exit 1
+              fi
+              tags+=("${tag}")
+            done < <(printf '%s\n' "${OCI_EXTRA_TARGET_TAGS}" | tr ',;' '\n')
+          fi
+
+          unique_tags=()
+          for tag in "${tags[@]}"; do
+            if [[ ! "${tag}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+              echo "invalid target tag: ${tag}"
+              exit 1
+            fi
+
+            seen="false"
+            for existing_tag in "${unique_tags[@]}"; do
+              if [[ "${existing_tag}" == "${tag}" ]]; then
+                seen="true"
+                break
+              fi
+            done
+
+            if [[ "${seen}" == "false" ]]; then
+              unique_tags+=("${tag}")
+            fi
+          done
+
+          promoted_tags_csv=""
+          promoted_refs_csv=""
+          for tag in "${unique_tags[@]}"; do
+            ref="${image_ref}:${tag}"
+            if [[ -z "${promoted_tags_csv}" ]]; then
+              promoted_tags_csv="${tag}"
+              promoted_refs_csv="${ref}"
+            else
+              promoted_tags_csv="${promoted_tags_csv},${tag}"
+              promoted_refs_csv="${promoted_refs_csv},${ref}"
+            fi
+          done
+
+          {
+            echo "image_ref=${image_ref}"
+            echo "digest=${digest}"
+            echo "image_with_digest=${image_with_digest}"
+            echo "source_ref=${source_ref}"
+            echo "source_tag=${source_tag}"
+            echo "release_version=${version}"
+            echo "promoted_tags=${promoted_tags_csv}"
+            echo "promoted_refs=${promoted_refs_csv}"
+            echo "promote_dry_run=${promote_dry_run}"
+            echo "tags<<EOF"
+            printf '%s\n' "${unique_tags[@]}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Promote tags from digest
+        id: promote
+        env:
+          IMAGE_REF: ${{ steps.resolve.outputs.image_ref }}
+          IMAGE_WITH_DIGEST: ${{ steps.resolve.outputs.image_with_digest }}
+          TAGS: ${{ steps.resolve.outputs.tags }}
+          PROMOTE_DRY_RUN: ${{ steps.resolve.outputs.promote_dry_run }}
+        run: |
+          set -euo pipefail
+
+          promoted_count=0
+          while IFS= read -r tag; do
+            if [[ -z "${tag}" ]]; then
+              continue
+            fi
+
+            target_ref="${IMAGE_REF}:${tag}"
+            if [[ "${PROMOTE_DRY_RUN}" == "true" ]]; then
+              echo "[DRY_RUN] docker buildx imagetools create --tag ${target_ref} ${IMAGE_WITH_DIGEST}"
+            else
+              docker buildx imagetools create --tag "${target_ref}" "${IMAGE_WITH_DIGEST}"
+            fi
+            promoted_count=$((promoted_count + 1))
+          done <<< "${TAGS}"
+
+          echo "promoted_count=${promoted_count}" >> "${GITHUB_OUTPUT}"
+
+      - name: Promotion summary
+        if: ${{ always() }}
+        env:
+          SOURCE_REF: ${{ steps.resolve.outputs.source_ref }}
+          DIGEST: ${{ steps.resolve.outputs.digest }}
+          IMAGE_WITH_DIGEST: ${{ steps.resolve.outputs.image_with_digest }}
+          RELEASE_VERSION: ${{ steps.resolve.outputs.release_version }}
+          PROMOTED_TAGS: ${{ steps.resolve.outputs.tags }}
+          IMAGE_REF: ${{ steps.resolve.outputs.image_ref }}
+          PROMOTE_DRY_RUN: ${{ steps.resolve.outputs.promote_dry_run }}
+          PROMOTED_COUNT: ${{ steps.promote.outputs.promoted_count }}
+        run: |
+          {
+            echo "### Docker Promote Summary"
+            echo ""
+            echo "- source: \`${SOURCE_REF}\`"
+            echo "- digest: \`${DIGEST}\`"
+            echo "- image_with_digest: \`${IMAGE_WITH_DIGEST}\`"
+            echo "- release_version: \`${RELEASE_VERSION}\`"
+            echo "- dry_run: \`${PROMOTE_DRY_RUN}\`"
+            echo "- promoted tags (${PROMOTED_COUNT}):"
+            while IFS= read -r tag; do
+              if [[ -n "${tag}" ]]; then
+                echo "  - \`${IMAGE_REF}:${tag}\`"
+              fi
+            done <<< "${PROMOTED_TAGS}"
+          } >> "${GITHUB_STEP_SUMMARY}"

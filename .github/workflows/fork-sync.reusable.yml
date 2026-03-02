@@ -37,6 +37,10 @@ permissions:
 jobs:
   fork_sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: fork-sync-${{ github.repository }}-${{ inputs.target_branch }}-${{ inputs.upstream_repo }}-${{ inputs.upstream_branch }}
+      cancel-in-progress: false
     defaults:
       run:
         shell: bash
@@ -47,7 +51,7 @@ jobs:
       synced: ${{ steps.finalize.outputs.synced }}
     steps:
       - name: Checkout target branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: ${{ inputs.target_branch }}
           fetch-depth: 0
