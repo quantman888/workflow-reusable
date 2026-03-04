@@ -1,11 +1,14 @@
 # workflow-reusable
 
-该仓库提供可复用的 Docker 镜像发布工作流：
+该仓库提供可复用工作流，当前包含：
 
-- 文件：`.github/workflows/docker-publish.reusable.yml`
-- 名称：`Docker Publish Reusable Workflow`
-- 触发方式：`workflow_call`（供其他仓库复用）和 `workflow_dispatch`（本仓库手动触发）
-- 变更策略：`OCI_*` 输入已硬切，不提供旧字段向后兼容
+- `.github/workflows/docker-publish.reusable.yml`：Docker 镜像构建发布 + 中环门禁
+- `.github/workflows/docker-promote.reusable.yml`：按 digest 做发布标签提升
+- `.github/workflows/fork-sync.reusable.yml`：fork 分支快进同步
+- `.github/workflows/branch-sync-pr.reusable.yml`：分支差异检测并自动开 PR
+- `.github/workflows/runner-fallback.reusable.yml`：先探测 self-hosted，再回退 github-hosted
+
+变更策略：各模块输入字段采用硬切命名，不提供旧字段向后兼容。
 
 ## 1. 调用方式（caller）
 
@@ -254,3 +257,112 @@ jobs:
       pr_title: "chore(sync): merge main into custom/docker"
       pr_body: "自动同步分支变更并创建 PR。"
 ```
+
+## 11. Runner Fallback Reusable
+
+文件：`.github/workflows/runner-fallback.reusable.yml`  
+用途：先探测 `self-hosted` runner 可用性；可用则走 `self-hosted`，不可用则按策略回退到 `github-hosted`。  
+变更策略：`RUNNER_*` 输入已硬切，不提供旧字段向后兼容。
+
+### Inputs 说明
+
+| 名称 | 类型 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- |
+| `RUNNER_SELF_HOSTED_LABELS` | `string` | 是 | 无 | self-hosted 目标标签（逗号/分号/换行分隔），例如 `self-hosted,linux,x64,ci-main` |
+| `RUNNER_GITHUB_HOSTED_LABEL` | `string` | 否 | `ubuntu-latest` | 回退使用的 GitHub-hosted 标签 |
+| `RUNNER_PROBE_SCOPE` | `string` | 否 | `auto` | 探测范围：`repo` / `org` / `auto`（按 `repo -> org` 顺序探测） |
+| `RUNNER_TARGET_REPOSITORY` | `string` | 否 | 空字符串 | 目标仓库，格式 `owner/repo`；为空则用当前仓库 |
+| `RUNNER_TARGET_ORG` | `string` | 否 | 空字符串 | 目标组织名；为空则使用目标仓库 owner |
+| `RUNNER_PROBE_REQUIRE_ONLINE` | `boolean` | 否 | `true` | 是否要求命中的 self-hosted runner 处于 `online` |
+| `RUNNER_PROBE_REQUIRE_IDLE` | `boolean` | 否 | `true` | 是否要求命中的 self-hosted runner 处于 `busy=false` |
+| `RUNNER_MIN_MATCH_COUNT` | `number` | 否 | `1` | 满足条件的最小命中数量 |
+| `RUNNER_PROBE_TIMEOUT_SECONDS` | `number` | 否 | `20` | 每个探测请求的超时秒数 |
+| `RUNNER_FALLBACK_POLICY` | `string` | 否 | `github-hosted` | 回退策略：`github-hosted` / `fail` |
+
+### Outputs 说明
+
+| 名称 | 类型 | 说明 |
+| --- | --- | --- |
+| `selected_runner` | `string` | 最终选择：`self-hosted` 或 `github-hosted` |
+| `use_self_hosted` | `string` | 是否使用 self-hosted（`true/false`） |
+| `use_github_hosted` | `string` | 是否使用 github-hosted（`true/false`） |
+| `resolved_self_hosted_labels` | `string` | 归一化后的 self-hosted 标签串（逗号分隔） |
+| `resolved_github_hosted_label` | `string` | 归一化后的 fallback 标签 |
+| `self_hosted_runs_on_json` | `string` | self-hosted 路由的 `runs-on` JSON 值（数组） |
+| `github_hosted_runs_on_json` | `string` | github-hosted 路由的 `runs-on` JSON 值（字符串） |
+| `selected_runs_on_json` | `string` | 当前选中路由对应的 `runs-on` JSON 值 |
+| `probe_scope_used` | `string` | 命中的探测范围：`repo` / `org` / `none` |
+| `matched_runner_count` | `string` | 命中的 runner 数量 |
+| `probe_reason` | `string` | 探测结果原因 |
+| `probe_summary` | `string` | 探测摘要 JSON（可用于审计与观测） |
+
+### Secrets 说明
+
+| 名称 | 必填 | 说明 |
+| --- | --- | --- |
+| `runner_probe_token` | 否 | 用于调用 runner API 的 token；未提供时回退使用 `${{ github.token }}`。组织级探测建议显式提供具有 `admin:org` 的 token |
+
+### 调用示例（caller：先探测，再分 self-hosted / github-hosted 两个 job）
+
+```yaml
+name: CI With Runner Fallback
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  runner-probe:
+    uses: <owner>/workflow-reusable/.github/workflows/runner-fallback.reusable.yml@main
+    with:
+      RUNNER_SELF_HOSTED_LABELS: self-hosted,linux,x64,ci-main
+      RUNNER_GITHUB_HOSTED_LABEL: ubuntu-22.04
+      RUNNER_PROBE_SCOPE: auto
+      RUNNER_PROBE_REQUIRE_ONLINE: true
+      RUNNER_PROBE_REQUIRE_IDLE: true
+      RUNNER_MIN_MATCH_COUNT: 1
+      RUNNER_FALLBACK_POLICY: github-hosted
+    secrets:
+      runner_probe_token: ${{ secrets.RUNNER_PROBE_TOKEN }}
+
+  build-self-hosted:
+    name: Build on self-hosted
+    needs: runner-probe
+    if: ${{ needs.runner-probe.outputs.use_self_hosted == 'true' }}
+    runs-on: [self-hosted, linux, x64, ci-main]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Build
+        run: |
+          set -euo pipefail
+          echo "Build on self-hosted runner"
+
+  build-github-hosted:
+    name: Build on github-hosted
+    needs: runner-probe
+    if: ${{ needs.runner-probe.outputs.use_github_hosted == 'true' }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Build
+        run: |
+          set -euo pipefail
+          echo "Build on github-hosted runner"
+```
+
+生产环境建议把 `@main` 换成受控版本 tag 或 commit SHA（例如 `@v1` 或 `@<40位SHA>`）。
+
+### 组织级最佳实践
+
+- 统一标签体系：组织内约定 `self-hosted` 基础标签与业务标签（如 `ci-main`/`build`/`deploy`）。
+- 回退策略分级：普通 CI 用 `github-hosted` 回退；关键发布链路可设 `RUNNER_FALLBACK_POLICY=fail` 防止静默降级。
+- 观测与审计：在调用方记录 `selected_runner`、`probe_reason`、`probe_summary` 便于容量规划和故障复盘。
+- 权限最小化：`runner_probe_token` 仅授予探测所需权限；组织探测场景推荐组织级 secret 统一分发。

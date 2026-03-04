@@ -1,0 +1,380 @@
+name: Runner Fallback Reusable
+
+on:
+  workflow_call:
+    inputs:
+      RUNNER_SELF_HOSTED_LABELS:
+        description: "Required labels for self-hosted runner (comma/semicolon/newline separated)"
+        required: true
+        type: string
+      RUNNER_GITHUB_HOSTED_LABEL:
+        description: "Fallback GitHub-hosted runner label"
+        required: false
+        type: string
+        default: "ubuntu-latest"
+      RUNNER_PROBE_SCOPE:
+        description: "Runner probe scope: repo|org|auto"
+        required: false
+        type: string
+        default: "auto"
+      RUNNER_TARGET_REPOSITORY:
+        description: "Target repository in owner/repo format (default: current repository)"
+        required: false
+        type: string
+        default: ""
+      RUNNER_TARGET_ORG:
+        description: "Target org name (default: repository owner)"
+        required: false
+        type: string
+        default: ""
+      RUNNER_PROBE_REQUIRE_ONLINE:
+        description: "Require runner status to be online"
+        required: false
+        type: boolean
+        default: true
+      RUNNER_PROBE_REQUIRE_IDLE:
+        description: "Require runner busy=false"
+        required: false
+        type: boolean
+        default: true
+      RUNNER_MIN_MATCH_COUNT:
+        description: "Minimum matched runner count to select self-hosted"
+        required: false
+        type: number
+        default: 1
+      RUNNER_PROBE_TIMEOUT_SECONDS:
+        description: "HTTP timeout for each probe request in seconds"
+        required: false
+        type: number
+        default: 20
+      RUNNER_FALLBACK_POLICY:
+        description: "Fallback policy: github-hosted|fail"
+        required: false
+        type: string
+        default: "github-hosted"
+    secrets:
+      runner_probe_token:
+        required: false
+    outputs:
+      selected_runner:
+        description: "Selected route: self-hosted|github-hosted"
+        value: ${{ jobs.probe.outputs.selected_runner }}
+      use_self_hosted:
+        description: "Whether to use self-hosted route"
+        value: ${{ jobs.probe.outputs.use_self_hosted }}
+      use_github_hosted:
+        description: "Whether to use github-hosted route"
+        value: ${{ jobs.probe.outputs.use_github_hosted }}
+      resolved_self_hosted_labels:
+        description: "Normalized self-hosted labels as comma-separated string"
+        value: ${{ jobs.probe.outputs.resolved_self_hosted_labels }}
+      resolved_github_hosted_label:
+        description: "Normalized fallback github-hosted label"
+        value: ${{ jobs.probe.outputs.resolved_github_hosted_label }}
+      self_hosted_runs_on_json:
+        description: "runs-on JSON value for self-hosted route"
+        value: ${{ jobs.probe.outputs.self_hosted_runs_on_json }}
+      github_hosted_runs_on_json:
+        description: "runs-on JSON value for github-hosted route"
+        value: ${{ jobs.probe.outputs.github_hosted_runs_on_json }}
+      selected_runs_on_json:
+        description: "runs-on JSON value for selected route"
+        value: ${{ jobs.probe.outputs.selected_runs_on_json }}
+      probe_scope_used:
+        description: "Probe scope that matched: repo|org|none"
+        value: ${{ jobs.probe.outputs.probe_scope_used }}
+      matched_runner_count:
+        description: "Matched runner count"
+        value: ${{ jobs.probe.outputs.matched_runner_count }}
+      probe_reason:
+        description: "Probe decision reason"
+        value: ${{ jobs.probe.outputs.probe_reason }}
+      probe_summary:
+        description: "Probe summary JSON for observability"
+        value: ${{ jobs.probe.outputs.probe_summary }}
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      selected_runner: ${{ steps.probe.outputs.selected_runner }}
+      use_self_hosted: ${{ steps.probe.outputs.use_self_hosted }}
+      use_github_hosted: ${{ steps.probe.outputs.use_github_hosted }}
+      resolved_self_hosted_labels: ${{ steps.probe.outputs.resolved_self_hosted_labels }}
+      resolved_github_hosted_label: ${{ steps.probe.outputs.resolved_github_hosted_label }}
+      self_hosted_runs_on_json: ${{ steps.probe.outputs.self_hosted_runs_on_json }}
+      github_hosted_runs_on_json: ${{ steps.probe.outputs.github_hosted_runs_on_json }}
+      selected_runs_on_json: ${{ steps.probe.outputs.selected_runs_on_json }}
+      probe_scope_used: ${{ steps.probe.outputs.probe_scope_used }}
+      matched_runner_count: ${{ steps.probe.outputs.matched_runner_count }}
+      probe_reason: ${{ steps.probe.outputs.probe_reason }}
+      probe_summary: ${{ steps.probe.outputs.probe_summary }}
+    steps:
+      - name: Probe self-hosted runner availability
+        id: probe
+        env:
+          RUNNER_SELF_HOSTED_LABELS: ${{ inputs.RUNNER_SELF_HOSTED_LABELS }}
+          RUNNER_GITHUB_HOSTED_LABEL: ${{ inputs.RUNNER_GITHUB_HOSTED_LABEL }}
+          RUNNER_PROBE_SCOPE: ${{ inputs.RUNNER_PROBE_SCOPE }}
+          RUNNER_TARGET_REPOSITORY: ${{ inputs.RUNNER_TARGET_REPOSITORY }}
+          RUNNER_TARGET_ORG: ${{ inputs.RUNNER_TARGET_ORG }}
+          RUNNER_PROBE_REQUIRE_ONLINE: ${{ inputs.RUNNER_PROBE_REQUIRE_ONLINE }}
+          RUNNER_PROBE_REQUIRE_IDLE: ${{ inputs.RUNNER_PROBE_REQUIRE_IDLE }}
+          RUNNER_MIN_MATCH_COUNT: ${{ inputs.RUNNER_MIN_MATCH_COUNT }}
+          RUNNER_PROBE_TIMEOUT_SECONDS: ${{ inputs.RUNNER_PROBE_TIMEOUT_SECONDS }}
+          RUNNER_FALLBACK_POLICY: ${{ inputs.RUNNER_FALLBACK_POLICY }}
+          RUNNER_PROBE_TOKEN_INPUT: ${{ secrets.runner_probe_token }}
+          RUNNER_PROBE_TOKEN_DEFAULT: ${{ github.token }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          python3 -X utf8 <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.request
+
+          output_path = os.environ["GITHUB_OUTPUT"]
+
+          def write_output(key: str, value: str) -> None:
+            with open(output_path, "a", encoding="utf-8") as f:
+              f.write(f"{key}={value}\n")
+
+          def parse_bool(raw: str, default: bool) -> bool:
+            if raw is None:
+              return default
+            v = str(raw).strip().lower()
+            if v in {"1", "true", "yes", "y", "on"}:
+              return True
+            if v in {"0", "false", "no", "n", "off"}:
+              return False
+            return default
+
+          labels_raw = os.environ.get("RUNNER_SELF_HOSTED_LABELS", "")
+          labels = [item.strip() for item in re.split(r"[,\n;]+", labels_raw) if item.strip()]
+          if not labels:
+            print("RUNNER_SELF_HOSTED_LABELS must not be empty", file=sys.stderr)
+            sys.exit(1)
+          labels_lower = [item.lower() for item in labels]
+
+          fallback_label = os.environ.get("RUNNER_GITHUB_HOSTED_LABEL", "ubuntu-latest").strip()
+          if not fallback_label:
+            fallback_label = "ubuntu-latest"
+
+          scope = os.environ.get("RUNNER_PROBE_SCOPE", "auto").strip().lower()
+          if scope not in {"repo", "org", "auto"}:
+            print("RUNNER_PROBE_SCOPE must be repo|org|auto", file=sys.stderr)
+            sys.exit(1)
+
+          fallback_policy = os.environ.get("RUNNER_FALLBACK_POLICY", "github-hosted").strip().lower()
+          if fallback_policy not in {"github-hosted", "fail"}:
+            print("RUNNER_FALLBACK_POLICY must be github-hosted|fail", file=sys.stderr)
+            sys.exit(1)
+
+          require_online = parse_bool(os.environ.get("RUNNER_PROBE_REQUIRE_ONLINE"), True)
+          require_idle = parse_bool(os.environ.get("RUNNER_PROBE_REQUIRE_IDLE"), True)
+
+          try:
+            min_match_count = int(str(os.environ.get("RUNNER_MIN_MATCH_COUNT", "1")).strip())
+          except ValueError:
+            print("RUNNER_MIN_MATCH_COUNT must be an integer", file=sys.stderr)
+            sys.exit(1)
+          if min_match_count < 1:
+            print("RUNNER_MIN_MATCH_COUNT must be >= 1", file=sys.stderr)
+            sys.exit(1)
+
+          try:
+            timeout_seconds = int(str(os.environ.get("RUNNER_PROBE_TIMEOUT_SECONDS", "20")).strip())
+          except ValueError:
+            print("RUNNER_PROBE_TIMEOUT_SECONDS must be an integer", file=sys.stderr)
+            sys.exit(1)
+          if timeout_seconds < 1:
+            timeout_seconds = 20
+
+          token = os.environ.get("RUNNER_PROBE_TOKEN_INPUT", "").strip()
+          if not token:
+            token = os.environ.get("RUNNER_PROBE_TOKEN_DEFAULT", "").strip()
+          if not token:
+            print("missing probe token (runner_probe_token or github.token)", file=sys.stderr)
+            sys.exit(1)
+
+          target_repository = os.environ.get("RUNNER_TARGET_REPOSITORY", "").strip()
+          if not target_repository:
+            target_repository = os.environ["GITHUB_REPOSITORY"].strip()
+          if "/" not in target_repository:
+            print("RUNNER_TARGET_REPOSITORY must be owner/repo", file=sys.stderr)
+            sys.exit(1)
+
+          owner, repo = target_repository.split("/", 1)
+          target_org = os.environ.get("RUNNER_TARGET_ORG", "").strip() or owner
+          api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
+
+          headers = {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+          }
+
+          def fetch_runners(endpoint: str):
+            runners = []
+            page = 1
+            while True:
+              url = f"{api_url}{endpoint}?per_page=100&page={page}"
+              req = urllib.request.Request(url, headers=headers)
+              try:
+                with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+                  payload = json.load(resp)
+              except urllib.error.HTTPError as e:
+                return None, f"http_{e.code}"
+              except Exception as e:  # pragma: no cover - runtime defensive
+                return None, f"request_error:{e.__class__.__name__}"
+
+              chunk = payload.get("runners", [])
+              if not isinstance(chunk, list):
+                return None, "invalid_payload"
+              runners.extend(chunk)
+
+              if len(chunk) < 100:
+                break
+              page += 1
+              if page > 20:
+                break
+
+            return runners, None
+
+          def match_runners(runners):
+            matched = []
+            for runner in runners:
+              status = str(runner.get("status", "")).lower()
+              busy = bool(runner.get("busy", False))
+              label_objs = runner.get("labels") or []
+              runner_labels = []
+              for item in label_objs:
+                if isinstance(item, dict) and item.get("name"):
+                  runner_labels.append(str(item["name"]).strip().lower())
+
+              if require_online and status != "online":
+                continue
+              if require_idle and busy:
+                continue
+              if any(label not in runner_labels for label in labels_lower):
+                continue
+
+              matched.append(
+                {
+                  "name": str(runner.get("name", "")),
+                  "status": status,
+                  "busy": busy,
+                }
+              )
+            return matched
+
+          if scope == "auto":
+            scopes_to_try = ["repo", "org"]
+          elif scope == "repo":
+            scopes_to_try = ["repo"]
+          else:
+            scopes_to_try = ["org"]
+
+          probe_details = []
+          api_errors = []
+          matched = []
+          selected_scope = "none"
+
+          for current_scope in scopes_to_try:
+            if current_scope == "repo":
+              endpoint = f"/repos/{owner}/{repo}/actions/runners"
+            else:
+              endpoint = f"/orgs/{target_org}/actions/runners"
+
+            runners, error = fetch_runners(endpoint)
+            if error:
+              api_errors.append(f"{current_scope}:{error}")
+              probe_details.append(
+                {
+                  "scope": current_scope,
+                  "endpoint": endpoint,
+                  "error": error,
+                  "total_runners": 0,
+                  "matched_count": 0,
+                }
+              )
+              continue
+
+            current_matched = match_runners(runners)
+            probe_details.append(
+              {
+                "scope": current_scope,
+                "endpoint": endpoint,
+                "error": "",
+                "total_runners": len(runners),
+                "matched_count": len(current_matched),
+              }
+            )
+
+            if len(current_matched) >= min_match_count:
+              matched = current_matched
+              selected_scope = current_scope
+              break
+
+          use_self_hosted = selected_scope != "none"
+          matched_runner_count = len(matched)
+
+          if use_self_hosted:
+            selected_runner = "self-hosted"
+            probe_reason = f"matched_{selected_scope}"
+          else:
+            selected_runner = "github-hosted"
+            if api_errors:
+              probe_reason = "api_error_fallback"
+            else:
+              probe_reason = "no_match_fallback"
+
+          if (not use_self_hosted) and fallback_policy == "fail":
+            if api_errors:
+              print(f"runner probe failed with API errors: {', '.join(api_errors)}", file=sys.stderr)
+            else:
+              print("runner probe found no matched self-hosted runner and fallback policy is fail", file=sys.stderr)
+            sys.exit(1)
+
+          selected_runs_on_json = json.dumps(labels if use_self_hosted else fallback_label)
+          summary = {
+            "selected_runner": selected_runner,
+            "selected_scope": selected_scope,
+            "matched_runner_count": matched_runner_count,
+            "required_labels": labels,
+            "require_online": require_online,
+            "require_idle": require_idle,
+            "fallback_policy": fallback_policy,
+            "target_repository": target_repository,
+            "target_org": target_org,
+            "probe_details": probe_details,
+            "api_errors": api_errors,
+            "matched_runner_names": [item["name"] for item in matched],
+          }
+
+          write_output("selected_runner", selected_runner)
+          write_output("use_self_hosted", "true" if use_self_hosted else "false")
+          write_output("use_github_hosted", "false" if use_self_hosted else "true")
+          write_output("resolved_self_hosted_labels", ",".join(labels))
+          write_output("resolved_github_hosted_label", fallback_label)
+          write_output("self_hosted_runs_on_json", json.dumps(labels))
+          write_output("github_hosted_runs_on_json", json.dumps(fallback_label))
+          write_output("selected_runs_on_json", selected_runs_on_json)
+          write_output("probe_scope_used", selected_scope)
+          write_output("matched_runner_count", str(matched_runner_count))
+          write_output("probe_reason", probe_reason)
+          write_output("probe_summary", json.dumps(summary, separators=(",", ":")))
+          PY
