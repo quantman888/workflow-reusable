@@ -81,6 +81,11 @@ on:
         required: false
         type: boolean
         default: false
+      RUNS_ON_JSON:
+        description: "JSON value for runs-on (for example: \"ubuntu-latest\" or [\"self-hosted\",\"linux\"])"
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
     outputs:
       image_ref:
         description: "Fully qualified image reference without tag"
@@ -106,7 +111,7 @@ permissions:
 jobs:
   docker_publish:
     name: Build And Publish OCI Image
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.RUNS_ON_JSON) }}
     timeout-minutes: 30
     outputs:
       image_ref: ${{ steps.tags.outputs.image_ref }}
@@ -231,7 +236,7 @@ jobs:
 
   image_gate:
     name: OCI Middle-Ring Gate
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.RUNS_ON_JSON) }}
     timeout-minutes: 20
     needs: docker_publish
     if: ${{ inputs.OCI_PUSH_IMAGE && needs.docker_publish.outputs.image_with_digest != '' }}
