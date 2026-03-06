@@ -35,6 +35,11 @@ on:
         required: false
         type: boolean
         default: false
+      RUNS_ON_JSON:
+        description: "JSON value for runs-on (for example: \"ubuntu-latest\" or [\"self-hosted\",\"linux\"])"
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
     outputs:
       image_ref:
         description: "Fully qualified image reference without tag"
@@ -75,7 +80,7 @@ permissions:
 jobs:
   docker_promote:
     name: Promote OCI Image Tags By Digest
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.RUNS_ON_JSON) }}
     timeout-minutes: 30
     concurrency:
       group: docker-promote-${{ github.repository }}-${{ inputs.OCI_REGISTRY }}-${{ inputs.OCI_IMAGE_NAME }}
