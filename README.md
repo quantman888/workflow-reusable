@@ -12,6 +12,28 @@
 
 变更策略：各模块输入字段采用硬切命名，不提供旧字段向后兼容。
 
+## 0. 仓库关系与升级入口
+
+当前组织把 workflow 治理拆成两层：
+
+- `quantman888/workflow-reusable`：运行时控制面与 reusable workflow 实现
+- `quantman888/.github`：组织模板入口与接入/升级/审计文档
+
+推荐入口：
+
+- 模板入口仓：`https://github.com/quantman888/.github`
+- 新仓接入清单：`https://github.com/quantman888/.github/blob/main/docs/new-repo-onboarding-checklist.md`
+- 发布与升级规范：`https://github.com/quantman888/.github/blob/main/docs/workflow-governance-release-process.md`
+- 组织基线审计：`https://github.com/quantman888/.github/blob/main/docs/org-workflow-baseline-audit-2026-03-07.md`
+
+治理闭环固定为：
+
+1. 先在本仓发布新的 reusable/control-plane 实现
+2. 再把 `quantman888/.github` 模板 pin 更新到新的 blessed SHA
+3. 最后由 caller 仓内的 `reusable-workflow-update-pr` 开 PR 升级现有业务仓引用
+
+不要把 `.github` 当成运行时控制面，也不要让 caller 仓直接长期跟随 `@main`。
+
 ## 1. 调用方式（caller）
 
 在调用方仓库的 workflow 中通过 `uses` 引用：
@@ -19,7 +41,7 @@
 ```yaml
 jobs:
   publish:
-    uses: <owner>/workflow-reusable/.github/workflows/docker-publish.reusable.yml@main
+    uses: <owner>/workflow-reusable/.github/workflows/docker-publish.reusable.yml@<pinned-ref>
     with:
       OCI_REGISTRY: ${{ vars.NEXUS_REGISTRY }}
       OCI_IMAGE_NAME: ${{ vars.IMAGE_NAME }}
@@ -43,7 +65,7 @@ jobs:
       nexus_password: ${{ secrets.NEXUS_PASSWORD }}
 ```
 
-生产环境建议把 `@main` 换成受控版本 tag 或 commit SHA（例如 `@v1` 或 `@<40位SHA>`）。
+生产环境不要使用 `@main`。统一改为受控版本 tag 或完整 commit SHA（例如 `@v1` 或 `@<40位SHA>`）。
 
 ## 1.1 GitHub App 治理约定
 
@@ -53,13 +75,13 @@ jobs:
 
 | 名称 | 类型 | 作用 |
 | --- | --- | --- |
-| `GH_APP_ID` | Secret/Variable | GitHub App ID |
+| `GH_APP_ID` | Secret | GitHub App ID。现有模板与 caller workflow 统一按 `secrets.GH_APP_ID` 读取。 |
 | `GH_APP_PRIVATE_KEY` | Secret | GitHub App 私钥 |
 | `RUNNER_PROBE_TOKEN` | Secret（可选） | `runner-fallback.reusable.yml` 探测 runner 时使用 |
 
 当前组织配置建议：
 
-- Public repositories：可直接使用 organization-level `GH_APP_ID` / `GH_APP_PRIVATE_KEY`
+- Public repositories：可直接使用 organization-level secrets 下发 `GH_APP_ID` / `GH_APP_PRIVATE_KEY`
 - Private repositories：在当前 GitHub 计划限制下，需为每个仓库同步同名 repo secrets
 - Workflow 引用：建议统一 pin 到 commit SHA，而不是直接引用浮动分支
 
@@ -119,7 +141,7 @@ jobs:
 ```yaml
 jobs:
   docker-publish:
-    uses: <owner>/workflow-reusable/.github/workflows/docker-publish.reusable.yml@main
+    uses: <owner>/workflow-reusable/.github/workflows/docker-publish.reusable.yml@<pinned-ref>
     with:
       OCI_REGISTRY: ${{ vars.NEXUS_REGISTRY }}
       OCI_IMAGE_NAME: ${{ vars.IMAGE_NAME }}
@@ -192,7 +214,7 @@ on:
 
 jobs:
   docker-publish:
-    uses: <owner>/workflow-reusable/.github/workflows/docker-publish.reusable.yml@main
+    uses: <owner>/workflow-reusable/.github/workflows/docker-publish.reusable.yml@<pinned-ref>
     with:
       OCI_REGISTRY: ${{ vars.NEXUS_REGISTRY }}
       OCI_IMAGE_NAME: ${{ vars.IMAGE_NAME }}
@@ -257,7 +279,7 @@ jobs:
 ```yaml
 jobs:
   sync-main:
-    uses: <owner>/workflow-reusable/.github/workflows/fork-sync.reusable.yml@main
+    uses: <owner>/workflow-reusable/.github/workflows/fork-sync.reusable.yml@<pinned-ref>
     with:
       target_branch: main
       upstream_repo: upstream-owner/upstream-repo
@@ -298,7 +320,7 @@ jobs:
 ```yaml
 jobs:
   open-sync-pr:
-    uses: <owner>/workflow-reusable/.github/workflows/branch-sync-pr.reusable.yml@main
+    uses: <owner>/workflow-reusable/.github/workflows/branch-sync-pr.reusable.yml@<pinned-ref>
     with:
       source_branch: main
       target_branch: custom/docker
@@ -372,7 +394,7 @@ permissions:
 
 jobs:
   runner-probe:
-    uses: <owner>/workflow-reusable/.github/workflows/runner-fallback.reusable.yml@main
+    uses: <owner>/workflow-reusable/.github/workflows/runner-fallback.reusable.yml@<pinned-ref>
     with:
       RUNNER_SELF_HOSTED_LABELS: self-hosted,linux,x64,ci-main
       RUNNER_GITHUB_HOSTED_LABEL: ubuntu-22.04
@@ -411,7 +433,7 @@ jobs:
           echo "Build on github-hosted runner"
 ```
 
-生产环境建议把 `@main` 换成受控版本 tag 或 commit SHA（例如 `@v1` 或 `@<40位SHA>`）。
+生产环境不要使用 `@main`。统一改为受控版本 tag 或完整 commit SHA（例如 `@v1` 或 `@<40位SHA>`）。
 
 ### 组织级最佳实践
 
