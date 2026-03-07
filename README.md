@@ -155,6 +155,8 @@ jobs:
         run: echo "${{ needs.docker-publish.outputs.image_with_digest }}"
 ```
 
+运行成功后，OCI job summary 固定输出三行：`image`、`tags`、`digest`；发布后门禁结果仍单独显示在 `Gate Checks` summary。
+
 ## 4. Secrets 说明
 
 | 名称 | 必填 | 说明 |

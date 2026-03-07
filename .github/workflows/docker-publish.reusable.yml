@@ -245,28 +245,18 @@ jobs:
       - name: Publish summary
         if: ${{ always() }}
         env:
-          OCI_PUSH_IMAGE: ${{ inputs.OCI_PUSH_IMAGE }}
           IMAGE_REF: ${{ steps.tags.outputs.image_ref }}
           IMAGE_TAGS: ${{ steps.tags.outputs.image_tags }}
-          IMAGE_WITH_DIGEST: ${{ steps.final_ref.outputs.image_with_digest }}
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
-
-          publish_mode="dry-run"
-          if [[ "${OCI_PUSH_IMAGE}" == "true" ]]; then
-            publish_mode="push"
-          fi
 
           {
             echo "### Published OCI Artifact"
             echo ""
-            echo "- mode: \`${publish_mode}\`"
             echo "- image: \`${IMAGE_REF}\`"
-            echo "- published_tags: \`${IMAGE_TAGS}\`"
-
-            if [[ -n "${IMAGE_WITH_DIGEST}" ]]; then
-              echo "- image_with_digest: \`${IMAGE_WITH_DIGEST}\`"
-            fi
+            echo "- tags: \`${IMAGE_TAGS}\`"
+            echo "- digest: \`${DIGEST}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
 
   image_gate:
