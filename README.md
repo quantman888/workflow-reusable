@@ -3,7 +3,7 @@
 该仓库提供可复用工作流，当前包含：
 
 - `.github/workflows/docker-publish.reusable.yml`：Docker 镜像构建发布 + 中环门禁
-- `.github/workflows/python-package-publish.reusable.yml`：Python 包构建发布 + Nexus 安装摘要
+- `.github/workflows/python-package-publish.reusable.yml`：Python 包构建发布 + 精确 wheel 安装摘要
 - `.github/workflows/docker-promote.reusable.yml`：按 digest 做发布标签提升
 - `.github/workflows/fork-sync.reusable.yml`：fork 分支快进同步
 - `.github/workflows/branch-sync-pr.reusable.yml`：分支差异检测并自动开 PR
@@ -281,7 +281,7 @@ jobs:
 - 包名与版本从构建产物元数据解析，不要求 caller 额外传入。
 - `PYTHON_PUSH_PACKAGE=false` 时仍会构建并输出元数据，但不会上传。
 - `PYTHON_SKIP_EXISTING=true` 时先查 simple index 中已存在的分发文件，只上传缺失文件，适合 Nexus 这类不支持 `twine --skip-existing` 的仓库。
-- 仅当 `PYTHON_PACKAGE_SIMPLE_URL` 非空时，summary 才输出 `pip install` 安装命令。
+- 仅当 `PYTHON_PACKAGE_SIMPLE_URL` 非空且可解析 wheel 下载链接时，summary 才输出精确到 wheel URL + SHA 的 `pip install` 安装命令。
 
 ## 9. Fork Sync Reusable
 

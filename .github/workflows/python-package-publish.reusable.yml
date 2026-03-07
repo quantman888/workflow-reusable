@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       PYTHON_PACKAGE_SIMPLE_URL:
-        description: "Optional simple index URL used in install summary"
+        description: "Optional simple index URL used to resolve exact wheel install command"
         required: false
         type: string
         default: ""
@@ -51,7 +51,7 @@ on:
         description: "Upload result: uploaded|skipped-existing|mixed|dry-run"
         value: ${{ jobs.python_package_publish.outputs.upload_result }}
       install_command:
-        description: "Suggested pip install command when simple index is configured"
+        description: "Exact pip install command for the resolved wheel URL"
         value: ${{ jobs.python_package_publish.outputs.install_command }}
     secrets:
       nexus_username:
@@ -72,7 +72,7 @@ jobs:
       package_version: ${{ steps.metadata.outputs.package_version }}
       dist_files: ${{ steps.metadata.outputs.dist_files }}
       upload_result: ${{ steps.publish.outputs.upload_result }}
-      install_command: ${{ steps.install_cmd.outputs.install_command }}
+      install_command: ${{ steps.resolve_install.outputs.install_command }}
     defaults:
       run:
         shell: bash
@@ -105,6 +105,7 @@ jobs:
           set -euo pipefail
           python -X utf8 <<'PY'
           import email
+          import hashlib
           import os
           import pathlib
           import zipfile
@@ -128,30 +129,14 @@ jobs:
             raise SystemExit("failed to resolve package name/version from wheel metadata")
 
           dist_files = sorted(path.name for path in dist_dir.iterdir() if path.is_file())
+          wheel_sha256 = hashlib.sha256(wheel_path.read_bytes()).hexdigest()
           with output_path.open("a", encoding="utf-8") as fh:
             fh.write(f"package_name={package_name}\n")
             fh.write(f"package_version={package_version}\n")
             fh.write(f"dist_files={','.join(dist_files)}\n")
+            fh.write(f"wheel_filename={wheel_path.name}\n")
+            fh.write(f"wheel_sha256={wheel_sha256}\n")
           PY
-
-      - name: Build install command
-        id: install_cmd
-        env:
-          PACKAGE_NAME: ${{ steps.metadata.outputs.package_name }}
-          PYTHON_PACKAGE_SIMPLE_URL: ${{ inputs.PYTHON_PACKAGE_SIMPLE_URL }}
-          PYTHON_PACKAGE_TRUSTED_HOST: ${{ inputs.PYTHON_PACKAGE_TRUSTED_HOST }}
-        run: |
-          set -euo pipefail
-
-          install_command=""
-          if [[ -n "${PACKAGE_NAME}" && -n "${PYTHON_PACKAGE_SIMPLE_URL}" ]]; then
-            install_command="pip install --upgrade ${PACKAGE_NAME} -i ${PYTHON_PACKAGE_SIMPLE_URL}"
-            if [[ -n "${PYTHON_PACKAGE_TRUSTED_HOST}" ]]; then
-              install_command="${install_command} --trusted-host ${PYTHON_PACKAGE_TRUSTED_HOST}"
-            fi
-          fi
-
-          echo "install_command=${install_command}" >> "${GITHUB_OUTPUT}"
 
       - name: Resolve upload plan
         id: upload_plan
@@ -289,38 +274,128 @@ jobs:
 
           echo "upload_result=${upload_result}" >> "${GITHUB_OUTPUT}"
 
+      - name: Resolve exact install command
+        id: resolve_install
+        if: ${{ always() && steps.publish.outcome == 'success' }}
+        env:
+          PACKAGE_NAME: ${{ steps.metadata.outputs.package_name }}
+          PYTHON_PACKAGE_SIMPLE_URL: ${{ inputs.PYTHON_PACKAGE_SIMPLE_URL }}
+          PYTHON_PACKAGE_TRUSTED_HOST: ${{ inputs.PYTHON_PACKAGE_TRUSTED_HOST }}
+          WHEEL_FILENAME: ${{ steps.metadata.outputs.wheel_filename }}
+          WHEEL_SHA256: ${{ steps.metadata.outputs.wheel_sha256 }}
+          TWINE_USERNAME: ${{ secrets.nexus_username }}
+          TWINE_PASSWORD: ${{ secrets.nexus_password }}
+        run: |
+          set -euo pipefail
+          python -X utf8 <<'PY'
+          import base64
+          import hashlib
+          import html.parser
+          import os
+          import pathlib
+          import re
+          import shlex
+          import urllib.parse
+          import urllib.request
+
+          output_path = pathlib.Path(os.environ["GITHUB_OUTPUT"])
+          package_name = os.environ["PACKAGE_NAME"].strip()
+          simple_url = os.environ["PYTHON_PACKAGE_SIMPLE_URL"].strip()
+          trusted_host = os.environ["PYTHON_PACKAGE_TRUSTED_HOST"].strip()
+          wheel_filename = os.environ["WHEEL_FILENAME"].strip()
+          local_wheel_sha256 = os.environ["WHEEL_SHA256"].strip()
+          username = os.environ.get("TWINE_USERNAME", "")
+          password = os.environ.get("TWINE_PASSWORD", "")
+
+          install_command = ""
+          if package_name and simple_url and wheel_filename:
+            try:
+              normalized_name = re.sub(r"[-_.]+", "-", package_name).lower()
+              if not simple_url.endswith("/"):
+                simple_url += "/"
+              index_url = urllib.parse.urljoin(simple_url, normalized_name + "/")
+
+              def build_request(url: str) -> urllib.request.Request:
+                request = urllib.request.Request(url)
+                if username or password:
+                  token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+                  request.add_header("Authorization", f"Basic {token}")
+                return request
+
+              with urllib.request.urlopen(build_request(index_url), timeout=20) as response:
+                html_body = response.read().decode("utf-8", errors="replace")
+
+              class LinkParser(html.parser.HTMLParser):
+                def __init__(self) -> None:
+                  super().__init__()
+                  self.hrefs: list[str] = []
+
+                def handle_starttag(self, tag: str, attrs) -> None:
+                  if tag != "a":
+                    return
+                  href = dict(attrs).get("href", "")
+                  if href:
+                    self.hrefs.append(href)
+
+              parser = LinkParser()
+              parser.feed(html_body)
+
+              matched_href = ""
+              for href in parser.hrefs:
+                parsed_href = urllib.parse.urlparse(href)
+                candidate = pathlib.PurePosixPath(
+                  urllib.parse.unquote(parsed_href.path)
+                ).name.strip()
+                if candidate == wheel_filename:
+                  matched_href = href
+                  break
+
+              if matched_href:
+                resolved_url = urllib.parse.urljoin(index_url, matched_href)
+                parsed_url = urllib.parse.urlparse(resolved_url)
+                wheel_url = urllib.parse.urlunparse(parsed_url._replace(fragment=""))
+
+                remote_sha256 = ""
+                for fragment_item in parsed_url.fragment.split("&"):
+                  if fragment_item.startswith("sha256="):
+                    remote_sha256 = fragment_item.split("=", 1)[1].strip()
+                    break
+
+                if not remote_sha256:
+                  with urllib.request.urlopen(build_request(wheel_url), timeout=30) as response:
+                    remote_sha256 = hashlib.sha256(response.read()).hexdigest()
+
+                final_sha256 = remote_sha256 or local_wheel_sha256
+                if final_sha256:
+                  wheel_url = f"{wheel_url}#sha256={final_sha256}"
+
+                command_parts = ["pip", "install"]
+                command_parts.extend(["--index-url", simple_url])
+                if trusted_host:
+                  command_parts.extend(["--trusted-host", trusted_host])
+                command_parts.append(wheel_url)
+                install_command = shlex.join(command_parts)
+            except Exception:
+              install_command = ""
+
+          with output_path.open("a", encoding="utf-8") as fh:
+            fh.write(f"install_command={install_command}\n")
+          PY
+
       - name: Publish summary
         if: ${{ always() }}
         env:
-          PYTHON_PUSH_PACKAGE: ${{ inputs.PYTHON_PUSH_PACKAGE }}
-          PYTHON_PACKAGE_REPOSITORY_URL: ${{ inputs.PYTHON_PACKAGE_REPOSITORY_URL }}
-          PYTHON_PACKAGE_SIMPLE_URL: ${{ inputs.PYTHON_PACKAGE_SIMPLE_URL }}
           PACKAGE_NAME: ${{ steps.metadata.outputs.package_name }}
           PACKAGE_VERSION: ${{ steps.metadata.outputs.package_version }}
-          DIST_FILES: ${{ steps.metadata.outputs.dist_files }}
-          UPLOAD_RESULT: ${{ steps.publish.outputs.upload_result }}
-          INSTALL_COMMAND: ${{ steps.install_cmd.outputs.install_command }}
+          INSTALL_COMMAND: ${{ steps.resolve_install.outputs.install_command }}
         run: |
           set -euo pipefail
-
-          publish_mode="dry-run"
-          if [[ "${PYTHON_PUSH_PACKAGE}" == "true" ]]; then
-            publish_mode="push"
-          fi
 
           {
             echo "### Published Python Package"
             echo ""
-            echo "- mode: \`${publish_mode}\`"
-            echo "- result: \`${UPLOAD_RESULT:-unknown}\`"
             echo "- package: \`${PACKAGE_NAME}\`"
             echo "- version: \`${PACKAGE_VERSION}\`"
-            echo "- files: \`${DIST_FILES}\`"
-            echo "- repository: \`${PYTHON_PACKAGE_REPOSITORY_URL}\`"
-
-            if [[ -n "${PYTHON_PACKAGE_SIMPLE_URL}" ]]; then
-              echo "- simple_index: \`${PYTHON_PACKAGE_SIMPLE_URL}\`"
-            fi
 
             if [[ -n "${INSTALL_COMMAND}" ]]; then
               echo "- pip_install: \`${INSTALL_COMMAND}\`"
