@@ -339,7 +339,16 @@ jobs:
             status="$(docker inspect -f '{{.State.Status}}' "${container_name}" 2>/dev/null || true)"
             case "${status}" in
               running)
-                break
+                sleep 2
+                stable_status="$(docker inspect -f '{{.State.Status}}' "${container_name}" 2>/dev/null || true)"
+                if [[ "${stable_status}" == "running" ]]; then
+                  break
+                fi
+                if [[ "${stable_status}" == "exited" || "${stable_status}" == "dead" ]]; then
+                  docker logs "${container_name}" || true
+                  echo "container ${container_name} terminated shortly after reaching running state" >&2
+                  exit 1
+                fi
                 ;;
               exited|dead)
                 docker logs "${container_name}" || true

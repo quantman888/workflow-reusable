@@ -182,6 +182,7 @@ jobs:
    - 仅当 `OCI_PUSH_IMAGE=true` 且 `image_with_digest` 非空时，才运行 `OCI Middle-Ring Gate`（`image_gate` job）。
 5. 镜像启动门禁（`Startup gate`）：
    - 先按 digest 拉取镜像，再执行 `docker run`，容器必须在超时内进入 `running` 状态。
+   - 进入 `running` 后还会做一个短暂稳定性复检，避免“刚启动就退出”的假阳性。
    - 超时由 `OCI_GATE_TIMEOUT_SECONDS` 控制。
    - 可通过 `OCI_GATE_RUN_ARGS` 追加环境变量、挂载和端口，并通过 `OCI_GATE_COMMAND` 对齐调用方的实际启动命令。
    - 当 `OCI_GATE_RUN_ARGS` 需要引用工作区文件做 bind mount 时，使用 `__GITHUB_WORKSPACE__` 作为占位符，reusable 会在运行时替换成真实工作目录。
