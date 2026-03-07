@@ -7,6 +7,7 @@
 - `.github/workflows/fork-sync.reusable.yml`：fork 分支快进同步
 - `.github/workflows/branch-sync-pr.reusable.yml`：分支差异检测并自动开 PR
 - `.github/workflows/runner-fallback.reusable.yml`：先探测 self-hosted，再回退 github-hosted
+- `.github/workflows/github-app-secret-sync.controlplane.yml`：把 `GH_APP_*` 同步到 private repos 的公共控制面
 
 变更策略：各模块输入字段采用硬切命名，不提供旧字段向后兼容。
 
@@ -60,6 +61,14 @@ jobs:
 - Public repositories：可直接使用 organization-level `GH_APP_ID` / `GH_APP_PRIVATE_KEY`
 - Private repositories：在当前 GitHub 计划限制下，需为每个仓库同步同名 repo secrets
 - Workflow 引用：建议统一 pin 到 commit SHA，而不是直接引用浮动分支
+
+为了解决 private repositories 无法直接消费 organization secrets 的限制，仓库内提供了公共控制面 workflow：
+
+- 文件：`.github/workflows/github-app-secret-sync.controlplane.yml`
+- 作用：按计划任务或手动触发，把 `GH_APP_ID` 与 `GH_APP_PRIVATE_KEY` 同步到目标仓库的 repository secrets
+- 前提：GitHub App installation 已授予 `Secrets: Read and write`
+- 覆盖方式：基于 GitHub API 分页扫描组织仓库，不依赖固定仓库清单；新仓库会在下次计划任务中自动补齐
+- 推荐策略：计划任务保持 `private` 默认值；如需一次性补齐 public/private 全量仓库，可手动以 `target_visibility=all` 触发
 
 分支同步类 workflow 会把 token 权限显式收敛为当前仓库所需的最小集合：
 
