@@ -234,6 +234,48 @@ jobs:
             echo "image_with_digest=" >> "${GITHUB_OUTPUT}"
           fi
 
+      - name: Publish summary
+        if: ${{ always() }}
+        env:
+          OCI_PUSH_IMAGE: ${{ inputs.OCI_PUSH_IMAGE }}
+          OCI_PUBLISH_CHANNEL: ${{ inputs.OCI_PUBLISH_CHANNEL }}
+          IMAGE_REF: ${{ steps.tags.outputs.image_ref }}
+          IMAGE_TAGS: ${{ steps.tags.outputs.image_tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE_WITH_DIGEST: ${{ steps.final_ref.outputs.image_with_digest }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "### Docker Publish Summary"
+            echo ""
+            echo "- push: \`${OCI_PUSH_IMAGE}\`"
+            echo "- publish_channel: \`${OCI_PUBLISH_CHANNEL}\`"
+            echo "- image_ref: \`${IMAGE_REF}\`"
+
+            if [[ -n "${IMAGE_TAGS}" ]]; then
+              echo "- published_tags:"
+              IFS=',' read -r -a tags <<< "${IMAGE_TAGS}"
+              for tag in "${tags[@]}"; do
+                echo "  - \`${IMAGE_REF}:${tag}\`"
+              done
+            else
+              echo "- published_tags: _none_"
+            fi
+
+            if [[ -n "${DIGEST}" ]]; then
+              echo "- digest: \`${DIGEST}\`"
+            else
+              echo "- digest: _not available_"
+            fi
+
+            if [[ -n "${IMAGE_WITH_DIGEST}" ]]; then
+              echo "- image_with_digest: \`${IMAGE_WITH_DIGEST}\`"
+            else
+              echo "- image_with_digest: _not available_"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
   image_gate:
     name: OCI Middle-Ring Gate
     runs-on: ${{ fromJSON(inputs.RUNS_ON_JSON) }}
@@ -305,6 +347,7 @@ jobs:
           echo "container_name=${container_name}" >> "${GITHUB_OUTPUT}"
 
       - name: Optional health URL check
+        id: health
         if: ${{ inputs.OCI_GATE_HEALTH_URL != '' }}
         env:
           OCI_GATE_HEALTH_URL: ${{ inputs.OCI_GATE_HEALTH_URL }}
@@ -324,6 +367,7 @@ jobs:
           done
 
       - name: Optional smoke command
+        id: smoke
         if: ${{ inputs.OCI_GATE_SMOKE_CMD != '' }}
         env:
           CONTAINER_NAME: ${{ steps.startup.outputs.container_name }}
@@ -333,6 +377,7 @@ jobs:
           docker exec "${CONTAINER_NAME}" sh -lc "${OCI_GATE_SMOKE_CMD}"
 
       - name: Vulnerability scan
+        id: vuln_scan
         env:
           IMAGE_WITH_DIGEST: ${{ needs.docker_publish.outputs.image_with_digest }}
           OCI_GATE_VULN_SEVERITY: ${{ inputs.OCI_GATE_VULN_SEVERITY }}
@@ -399,6 +444,41 @@ jobs:
           name: trivy-image-report
           path: .artifacts/trivy/trivy-report.json
           if-no-files-found: warn
+
+      - name: Gate summary
+        if: ${{ always() }}
+        env:
+          IMAGE_WITH_DIGEST: ${{ needs.docker_publish.outputs.image_with_digest }}
+          STARTUP_OUTCOME: ${{ steps.startup.outcome }}
+          HEALTH_OUTCOME: ${{ steps.health.outcome }}
+          SMOKE_OUTCOME: ${{ steps.smoke.outcome }}
+          VULN_SCAN_OUTCOME: ${{ steps.vuln_scan.outcome }}
+          OCI_GATE_HEALTH_URL: ${{ inputs.OCI_GATE_HEALTH_URL }}
+          OCI_GATE_SMOKE_CMD: ${{ inputs.OCI_GATE_SMOKE_CMD }}
+          OCI_GATE_VULN_SEVERITY: ${{ inputs.OCI_GATE_VULN_SEVERITY }}
+          OCI_GATE_VULN_IGNORE_UNFIXED: ${{ inputs.OCI_GATE_VULN_IGNORE_UNFIXED }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "### Docker Gate Summary"
+            echo ""
+            echo "- image_with_digest: \`${IMAGE_WITH_DIGEST}\`"
+            echo "- startup_gate: \`${STARTUP_OUTCOME}\`"
+
+            if [[ -n "${OCI_GATE_HEALTH_URL}" ]]; then
+              echo "- health_url: \`${OCI_GATE_HEALTH_URL}\`"
+              echo "- health_check: \`${HEALTH_OUTCOME}\`"
+            fi
+
+            if [[ -n "${OCI_GATE_SMOKE_CMD}" ]]; then
+              echo "- smoke_check: \`${SMOKE_OUTCOME}\`"
+            fi
+
+            echo "- vuln_scan: \`${VULN_SCAN_OUTCOME}\`"
+            echo "- vuln_severity: \`${OCI_GATE_VULN_SEVERITY}\`"
+            echo "- ignore_unfixed: \`${OCI_GATE_VULN_IGNORE_UNFIXED}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Cleanup gate container
         if: ${{ always() && steps.startup.outputs.container_name != '' }}
