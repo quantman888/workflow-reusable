@@ -185,7 +185,7 @@ jobs:
    - 进入 `running` 后还会做一个短暂稳定性复检，避免“刚启动就退出”的假阳性。
    - 超时由 `OCI_GATE_TIMEOUT_SECONDS` 控制。
    - 可通过 `OCI_GATE_RUN_ARGS` 追加环境变量、挂载和端口，并通过 `OCI_GATE_COMMAND` 对齐调用方的实际启动命令。
-   - 当 `OCI_GATE_RUN_ARGS` 需要引用工作区文件做 bind mount 时，使用 `__GITHUB_WORKSPACE__` 作为占位符，reusable 会在运行时替换成真实工作目录。
+   - 门禁 job 会先 checkout 调用仓库；当 `OCI_GATE_RUN_ARGS` 需要引用工作区文件做 bind mount 时，使用 `__GITHUB_WORKSPACE__` 作为占位符，reusable 会在运行时替换成真实工作目录。
 6. 可选健康检查门禁（`Optional health URL check`）：
    - `OCI_GATE_HEALTH_URL` 非空时执行 HTTP 健康检查。
 7. 可选 smoke 门禁（`Optional smoke command`）：
