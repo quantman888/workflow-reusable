@@ -28,6 +28,11 @@ on:
         required: false
         type: string
         default: ".github/workflows/docker-publish.reusable.yml"
+      RUNS_ON_JSON:
+        description: "JSON value for runs-on (for example: \"ubuntu-latest\" or [\"self-hosted\",\"linux\"])"
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
       source_repository:
         description: "Dispatch source repository for audit trail"
         required: false
@@ -58,7 +63,7 @@ permissions:
 jobs:
   update_reusable_workflow_ref:
     name: Update Reusable Workflow Ref / Open PR
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.RUNS_ON_JSON) }}
     timeout-minutes: 20
     defaults:
       run:

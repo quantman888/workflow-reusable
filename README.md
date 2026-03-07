@@ -82,6 +82,7 @@ jobs:
 - 文件：`.github/workflows/reusable-workflow-update-pr.reusable.yml`
 - 作用：扫描调用方仓库 `.github/workflows` 中对中央 reusable 的引用，批量替换目标 ref，并用 App bot 推分支/开 PR
 - 适用：`workflow-reusable` 发布后，批量驱动各业务仓库 bump 到新的 SHA 或版本 tag
+- 运行方式：支持调用方先经 `runner-fallback.reusable.yml` 决定 `RUNS_ON_JSON`，再把选中的 runner 透传给该 reusable
 
 ## 2. Inputs 说明
 
