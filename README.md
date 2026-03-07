@@ -184,6 +184,7 @@ jobs:
    - 先按 digest 拉取镜像，再执行 `docker run`，容器必须在超时内进入 `running` 状态。
    - 超时由 `OCI_GATE_TIMEOUT_SECONDS` 控制。
    - 可通过 `OCI_GATE_RUN_ARGS` 追加环境变量、挂载和端口，并通过 `OCI_GATE_COMMAND` 对齐调用方的实际启动命令。
+   - 当 `OCI_GATE_RUN_ARGS` 需要引用工作区文件做 bind mount 时，使用 `__GITHUB_WORKSPACE__` 作为占位符，reusable 会在运行时替换成真实工作目录。
 6. 可选健康检查门禁（`Optional health URL check`）：
    - `OCI_GATE_HEALTH_URL` 非空时执行 HTTP 健康检查。
 7. 可选 smoke 门禁（`Optional smoke command`）：
