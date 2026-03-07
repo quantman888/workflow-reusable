@@ -280,7 +280,7 @@ jobs:
 
 - 包名与版本从构建产物元数据解析，不要求 caller 额外传入。
 - `PYTHON_PUSH_PACKAGE=false` 时仍会构建并输出元数据，但不会上传。
-- `PYTHON_SKIP_EXISTING=true` 时使用 `twine upload --skip-existing`，适合重复发布验证与幂等重跑。
+- `PYTHON_SKIP_EXISTING=true` 时先查 simple index 中已存在的分发文件，只上传缺失文件，适合 Nexus 这类不支持 `twine --skip-existing` 的仓库。
 - 仅当 `PYTHON_PACKAGE_SIMPLE_URL` 非空时，summary 才输出 `pip install` 安装命令。
 
 ## 9. Fork Sync Reusable

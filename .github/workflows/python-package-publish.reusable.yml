@@ -23,7 +23,7 @@ on:
         type: boolean
         default: true
       PYTHON_SKIP_EXISTING:
-        description: "Whether twine upload should skip existing files"
+        description: "Whether existing distributions should be skipped via simple-index preflight"
         required: false
         type: boolean
         default: true
@@ -153,12 +153,112 @@ jobs:
 
           echo "install_command=${install_command}" >> "${GITHUB_OUTPUT}"
 
+      - name: Resolve upload plan
+        id: upload_plan
+        env:
+          PYTHON_SKIP_EXISTING: ${{ inputs.PYTHON_SKIP_EXISTING }}
+          PYTHON_PACKAGE_SIMPLE_URL: ${{ inputs.PYTHON_PACKAGE_SIMPLE_URL }}
+          PACKAGE_NAME: ${{ steps.metadata.outputs.package_name }}
+          DIST_FILES: ${{ steps.metadata.outputs.dist_files }}
+          TWINE_USERNAME: ${{ secrets.nexus_username }}
+          TWINE_PASSWORD: ${{ secrets.nexus_password }}
+        run: |
+          set -euo pipefail
+          python -X utf8 <<'PY'
+          import base64
+          import html.parser
+          import os
+          import pathlib
+          import re
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          output_path = pathlib.Path(os.environ["GITHUB_OUTPUT"])
+          skip_existing = os.environ["PYTHON_SKIP_EXISTING"] == "true"
+          simple_url = os.environ["PYTHON_PACKAGE_SIMPLE_URL"].strip()
+          package_name = os.environ["PACKAGE_NAME"].strip()
+          dist_files = [item for item in os.environ["DIST_FILES"].split(",") if item]
+          username = os.environ.get("TWINE_USERNAME", "")
+          password = os.environ.get("TWINE_PASSWORD", "")
+
+          upload_files = list(dist_files)
+          existing_count = 0
+          probe_mode = "disabled"
+
+          if skip_existing and simple_url and package_name:
+            probe_mode = "probe-miss"
+            normalized_name = re.sub(r"[-_.]+", "-", package_name).lower()
+            if not simple_url.endswith("/"):
+              simple_url += "/"
+            index_url = urllib.parse.urljoin(simple_url, normalized_name + "/")
+            request = urllib.request.Request(index_url)
+            if username or password:
+              basic_auth = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+              request.add_header("Authorization", f"Basic {basic_auth}")
+
+            try:
+              with urllib.request.urlopen(request, timeout=20) as response:
+                html_body = response.read().decode("utf-8", errors="replace")
+            except urllib.error.HTTPError as exc:
+              if exc.code == 404:
+                html_body = ""
+              else:
+                probe_mode = f"http-{exc.code}"
+                html_body = None
+            except Exception:
+              probe_mode = "unavailable"
+              html_body = None
+
+            if html_body is not None:
+              class LinkParser(html.parser.HTMLParser):
+                def __init__(self) -> None:
+                  super().__init__()
+                  self.files: set[str] = set()
+
+                def handle_starttag(self, tag: str, attrs) -> None:
+                  if tag != "a":
+                    return
+                  href = dict(attrs).get("href", "")
+                  if not href:
+                    return
+                  parsed = urllib.parse.urlparse(href)
+                  candidate = pathlib.PurePosixPath(
+                    urllib.parse.unquote(parsed.path)
+                  ).name.strip()
+                  if candidate:
+                    self.files.add(candidate)
+
+              parser = LinkParser()
+              parser.feed(html_body)
+              upload_files = [name for name in dist_files if name not in parser.files]
+              existing_count = len(dist_files) - len(upload_files)
+              if existing_count == 0:
+                probe_mode = "none-present"
+              elif existing_count == len(dist_files):
+                probe_mode = "all-present"
+              else:
+                probe_mode = "partial-present"
+          elif skip_existing:
+            probe_mode = "no-simple-index"
+
+          with output_path.open("a", encoding="utf-8") as fh:
+            fh.write(f"probe_mode={probe_mode}\n")
+            fh.write(f"existing_file_count={existing_count}\n")
+            fh.write("upload_files<<EOF\n")
+            for filename in upload_files:
+              fh.write(f"dist/{filename}\n")
+            fh.write("EOF\n")
+          PY
+
       - name: Upload distributions
         id: publish
         env:
           PYTHON_PUSH_PACKAGE: ${{ inputs.PYTHON_PUSH_PACKAGE }}
-          PYTHON_SKIP_EXISTING: ${{ inputs.PYTHON_SKIP_EXISTING }}
           PYTHON_PACKAGE_REPOSITORY_URL: ${{ inputs.PYTHON_PACKAGE_REPOSITORY_URL }}
+          DIST_FILES: ${{ steps.metadata.outputs.dist_files }}
+          EXISTING_FILE_COUNT: ${{ steps.upload_plan.outputs.existing_file_count }}
+          UPLOAD_FILES: ${{ steps.upload_plan.outputs.upload_files }}
           TWINE_USERNAME: ${{ secrets.nexus_username }}
           TWINE_PASSWORD: ${{ secrets.nexus_password }}
         run: |
@@ -169,9 +269,10 @@ jobs:
             exit 0
           fi
 
-          extra_args=()
-          if [[ "${PYTHON_SKIP_EXISTING}" == "true" ]]; then
-            extra_args+=(--skip-existing)
+          mapfile -t upload_files < <(printf '%s\n' "${UPLOAD_FILES}" | sed '/^$/d')
+          if (( ${#upload_files[@]} == 0 )); then
+            echo "upload_result=skipped-existing" >> "${GITHUB_OUTPUT}"
+            exit 0
           fi
 
           upload_log="$(mktemp)"
@@ -179,15 +280,11 @@ jobs:
 
           python -X utf8 -m twine upload \
             --repository-url "${PYTHON_PACKAGE_REPOSITORY_URL}" \
-            "${extra_args[@]}" \
-            dist/* 2>&1 | tee "${upload_log}"
+            "${upload_files[@]}" 2>&1 | tee "${upload_log}"
 
-          if grep -q "^Skipping " "${upload_log}" && grep -q "^Uploading " "${upload_log}"; then
+          upload_result="uploaded"
+          if [[ "${EXISTING_FILE_COUNT:-0}" != "0" ]]; then
             upload_result="mixed"
-          elif grep -q "^Skipping " "${upload_log}"; then
-            upload_result="skipped-existing"
-          else
-            upload_result="uploaded"
           fi
 
           echo "upload_result=${upload_result}" >> "${GITHUB_OUTPUT}"
