@@ -66,7 +66,6 @@ jobs:
 - `contents: write`
 - `pull-requests: write`（仅 `branch-sync-pr.reusable.yml`）
 - `workflows: write`
-- `actions: read`
 
 ## 2. Inputs 说明
 

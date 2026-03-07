@@ -83,7 +83,6 @@ jobs:
           private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
-          permission-actions: read
           permission-contents: write
           permission-workflows: write
 
