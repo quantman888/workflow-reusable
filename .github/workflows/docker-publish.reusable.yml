@@ -56,6 +56,11 @@ on:
         required: false
         type: string
         default: ""
+      OCI_GATE_COMMAND:
+        description: "Optional command override executed after image reference in startup gate"
+        required: false
+        type: string
+        default: ""
       OCI_GATE_HEALTH_URL:
         description: "Optional health check URL for startup gate"
         required: false
@@ -289,6 +294,7 @@ jobs:
         env:
           IMAGE_WITH_DIGEST: ${{ needs.docker_publish.outputs.image_with_digest }}
           OCI_GATE_RUN_ARGS: ${{ inputs.OCI_GATE_RUN_ARGS }}
+          OCI_GATE_COMMAND: ${{ inputs.OCI_GATE_COMMAND }}
           OCI_GATE_TIMEOUT_SECONDS: ${{ inputs.OCI_GATE_TIMEOUT_SECONDS }}
         run: |
           set -euo pipefail
@@ -296,13 +302,24 @@ jobs:
           container_name="oci-gate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           timeout_seconds="${OCI_GATE_TIMEOUT_SECONDS:-60}"
 
+          parse_shlex_args() {
+            local raw_value="$1"
+            python -X utf8 -c 'import shlex, sys; print("\\n".join(shlex.split(sys.argv[1])))' "${raw_value}"
+          }
+
           if [[ -n "${OCI_GATE_RUN_ARGS}" ]]; then
-            read -r -a run_args <<< "${OCI_GATE_RUN_ARGS}"
+            mapfile -t run_args < <(parse_shlex_args "${OCI_GATE_RUN_ARGS}")
           else
             run_args=()
           fi
 
-          docker run -d --name "${container_name}" "${run_args[@]}" "${IMAGE_WITH_DIGEST}" >/dev/null
+          if [[ -n "${OCI_GATE_COMMAND}" ]]; then
+            mapfile -t command_args < <(parse_shlex_args "${OCI_GATE_COMMAND}")
+          else
+            command_args=()
+          fi
+
+          docker run -d --name "${container_name}" "${run_args[@]}" "${IMAGE_WITH_DIGEST}" "${command_args[@]}" >/dev/null
 
           start_epoch="$(date +%s)"
           while true; do

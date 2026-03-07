@@ -124,6 +124,7 @@ jobs:
 | `OCI_PUBLISH_LATEST` | `boolean` | 否 | `false` | 仅在稳定版 release（`x.y.z`）时可额外产出 `latest` |
 | `OCI_GATE_TIMEOUT_SECONDS` | `number` | 否 | `60` | 启动门禁/健康检查超时秒数 |
 | `OCI_GATE_RUN_ARGS` | `string` | 否 | 空字符串 | 启动检查时附加的 `docker run` 参数 |
+| `OCI_GATE_COMMAND` | `string` | 否 | 空字符串 | 启动检查时覆盖镜像默认命令，适合对齐 `docker-compose.yml` 的 `command` |
 | `OCI_GATE_HEALTH_URL` | `string` | 否 | 空字符串 | 可选健康检查 URL，非空时执行 HTTP 检查 |
 | `OCI_GATE_SMOKE_CMD` | `string` | 否 | 空字符串 | 可选 smoke 命令，非空时在容器内执行 |
 | `OCI_GATE_VULN_SEVERITY` | `string` | 否 | `CRITICAL,HIGH` | Trivy 漏洞门禁严重级别（逗号分隔） |
@@ -182,7 +183,7 @@ jobs:
 5. 镜像启动门禁（`Startup gate`）：
    - 先按 digest 拉取镜像，再执行 `docker run`，容器必须在超时内进入 `running` 状态。
    - 超时由 `OCI_GATE_TIMEOUT_SECONDS` 控制。
-   - 可通过 `OCI_GATE_RUN_ARGS` 传入启动参数。
+   - 可通过 `OCI_GATE_RUN_ARGS` 追加环境变量、挂载和端口，并通过 `OCI_GATE_COMMAND` 对齐调用方的实际启动命令。
 6. 可选健康检查门禁（`Optional health URL check`）：
    - `OCI_GATE_HEALTH_URL` 非空时执行 HTTP 健康检查。
 7. 可选 smoke 门禁（`Optional smoke command`）：
