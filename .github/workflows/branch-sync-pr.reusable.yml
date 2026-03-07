@@ -23,6 +23,11 @@ on:
         required: false
         type: string
         default: "自动同步分支变更并创建 PR。"
+      auto_resolve_theirs_paths:
+        description: "Optional newline-separated paths/directories that should use source(theirs) on merge conflicts"
+        required: false
+        type: string
+        default: ""
     outputs:
       has_new_commits:
         description: "Whether source has commits not in target"
@@ -36,14 +41,34 @@ on:
       pr_url:
         description: "Existing or newly created PR URL"
         value: ${{ jobs.open_branch_pr.outputs.pr_url }}
+    secrets:
+      RUNNER_PROBE_TOKEN:
+        required: false
+      GH_APP_ID:
+        required: true
+      GH_APP_PRIVATE_KEY:
+        required: true
 
 permissions:
-  contents: read
+  actions: read
+  contents: write
   pull-requests: write
 
 jobs:
+  runner_probe:
+    name: Branch Sync PR / Runner Probe
+    uses: ./.github/workflows/runner-fallback.reusable.yml
+    with:
+      RUNNER_SELF_HOSTED_LABELS: ${{ vars.RUNNER_SELF_HOSTED_LABELS || 'self-hosted,linux,x64' }}
+      RUNNER_GITHUB_HOSTED_LABEL: ${{ vars.RUNNER_GITHUB_HOSTED_LABEL || 'ubuntu-latest' }}
+      RUNNER_FALLBACK_POLICY: github-hosted
+    secrets:
+      runner_probe_token: ${{ secrets.RUNNER_PROBE_TOKEN }}
+
   open_branch_pr:
-    runs-on: ubuntu-latest
+    name: Branch Sync PR / Open or Reuse
+    needs: [runner_probe]
+    runs-on: ${{ fromJSON(needs.runner_probe.outputs.selected_runs_on_json) }}
     defaults:
       run:
         shell: bash
@@ -53,10 +78,44 @@ jobs:
       pr_created: ${{ steps.pr.outputs.pr_created }}
       pr_url: ${{ steps.pr.outputs.pr_url }}
     steps:
+      - name: Generate GitHub App token
+        id: app_token
+        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2
+        with:
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-actions: read
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
+
+      - name: Resolve GitHub App bot identity
+        id: bot_identity
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          set -euo pipefail
+          app_slug="${{ steps.app_token.outputs.app-slug }}"
+          user_id="$(gh api "/users/${app_slug}[bot]" --jq '.id')"
+
+          {
+            echo "name=${app_slug}[bot]"
+            echo "email=${user_id}+${app_slug}[bot]@users.noreply.github.com"
+          } >> "${GITHUB_OUTPUT}"
+
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
+          token: ${{ steps.app_token.outputs.token }}
+
+      - name: Configure git user
+        run: |
+          set -euo pipefail
+          git config user.name "${{ steps.bot_identity.outputs.name }}"
+          git config user.email "${{ steps.bot_identity.outputs.email }}"
 
       - name: Fetch source and target branches
         run: |
@@ -71,41 +130,116 @@ jobs:
       - name: Check commits and open/create PR
         id: pr
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
         run: |
           set -euo pipefail
           source_branch="${{ inputs.source_branch }}"
           target_branch="${{ inputs.target_branch }}"
-          repo_owner="${{ github.repository_owner }}"
           pr_title="${{ inputs.pr_title }}"
           pr_body="${{ inputs.pr_body }}"
+          auto_resolve_theirs_paths="${{ inputs.auto_resolve_theirs_paths }}"
+          repo="${{ github.repository }}"
+          repo_owner="${{ github.repository_owner }}"
 
           has_new_commits="false"
           pr_exists="false"
           pr_created="false"
           pr_url=""
+          pr_head_branch="${source_branch}"
 
           commit_count="$(git rev-list --count "origin/${target_branch}..origin/${source_branch}")"
           if [[ "${commit_count}" -gt 0 ]]; then
             has_new_commits="true"
 
-            existing_pr_url="$(gh pr list \
-              --state open \
-              --base "${target_branch}" \
-              --head "${repo_owner}:${source_branch}" \
-              --json url \
-              --jq '.[0].url // ""')"
+            if [[ -n "${auto_resolve_theirs_paths}" ]]; then
+              pr_head_branch="sync/${source_branch}-into-${target_branch}"
+              pr_head_branch="${pr_head_branch// /-}"
+
+              git checkout -B "${pr_head_branch}" "origin/${target_branch}"
+              set +e
+              git merge --no-ff --no-edit "origin/${source_branch}"
+              merge_code=$?
+              set -e
+
+              if [[ ${merge_code} -ne 0 ]]; then
+                while IFS= read -r path; do
+                  [[ -z "${path}" ]] && continue
+                  git checkout --theirs -- "${path}" || true
+                done <<< "${auto_resolve_theirs_paths}"
+
+                if git diff --name-only --diff-filter=U | grep -q .; then
+                  echo "Unresolved conflicts remain after auto-resolve:" >&2
+                  git diff --name-only --diff-filter=U >&2
+                  exit 1
+                fi
+
+                git add -A
+                if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+                  git commit --no-edit
+                fi
+              fi
+
+              git push --force-with-lease origin "${pr_head_branch}"
+            fi
+
+            pr_head_ref="${repo_owner}:${pr_head_branch}"
+            existing_pr_url="$(gh api \
+              -H 'Accept: application/vnd.github+json' \
+              "repos/${repo}/pulls?state=open&base=${target_branch}&head=${pr_head_ref}" \
+              --jq '.[0].html_url // ""')"
 
             if [[ -n "${existing_pr_url}" ]]; then
               pr_exists="true"
               pr_url="${existing_pr_url}"
             else
-              pr_url="$(gh pr create \
-                --base "${target_branch}" \
-                --head "${repo_owner}:${source_branch}" \
-                --title "${pr_title}" \
-                --body "${pr_body}")"
-              pr_created="true"
+              max_attempts=3
+              attempt=1
+              delay_seconds=2
+              pr_create_output=""
+              pr_create_code=1
+
+              while [[ ${attempt} -le ${max_attempts} ]]; do
+                set +e
+                pr_create_output="$(gh api \
+                  --method POST \
+                  -H 'Accept: application/vnd.github+json' \
+                  "repos/${repo}/pulls" \
+                  -f title="${pr_title}" \
+                  -f body="${pr_body}" \
+                  -f base="${target_branch}" \
+                  -f head="${pr_head_ref}" \
+                  --jq '.html_url' 2>&1)"
+                pr_create_code=$?
+                set -e
+
+                if [[ ${pr_create_code} -eq 0 ]]; then
+                  pr_url="${pr_create_output}"
+                  pr_created="true"
+                  break
+                fi
+
+                if echo "${pr_create_output}" | grep -qi 'already exists'; then
+                  existing_pr_url="$(gh api \
+                    -H 'Accept: application/vnd.github+json' \
+                    "repos/${repo}/pulls?state=open&base=${target_branch}&head=${pr_head_ref}" \
+                    --jq '.[0].html_url // ""')"
+                  if [[ -n "${existing_pr_url}" ]]; then
+                    pr_exists="true"
+                    pr_url="${existing_pr_url}"
+                    break
+                  fi
+                fi
+
+                if [[ ${attempt} -ge ${max_attempts} ]]; then
+                  echo "${pr_create_output}" >&2
+                  exit 1
+                fi
+
+                echo "create pull request failed (attempt ${attempt}/${max_attempts}), retrying in ${delay_seconds}s" >&2
+                sleep "${delay_seconds}"
+                delay_seconds=$((delay_seconds * 2))
+                attempt=$((attempt + 1))
+              done
             fi
           fi
 

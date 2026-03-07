@@ -43,6 +43,31 @@ jobs:
 
 生产环境建议把 `@main` 换成受控版本 tag 或 commit SHA（例如 `@v1` 或 `@<40位SHA>`）。
 
+## 1.1 GitHub App 治理约定
+
+分支同步类 workflow 统一采用 GitHub App installation token，不再依赖 `github.token`、长期 PAT 或仓库特有兜底 token。
+
+调用方统一准备以下密钥：
+
+| 名称 | 类型 | 作用 |
+| --- | --- | --- |
+| `GH_APP_ID` | Secret/Variable | GitHub App ID |
+| `GH_APP_PRIVATE_KEY` | Secret | GitHub App 私钥 |
+| `RUNNER_PROBE_TOKEN` | Secret（可选） | `runner-fallback.reusable.yml` 探测 runner 时使用 |
+
+当前组织配置建议：
+
+- Public repositories：可直接使用 organization-level `GH_APP_ID` / `GH_APP_PRIVATE_KEY`
+- Private repositories：在当前 GitHub 计划限制下，需为每个仓库同步同名 repo secrets
+- Workflow 引用：建议统一 pin 到 commit SHA，而不是直接引用浮动分支
+
+分支同步类 workflow 会把 token 权限显式收敛为当前仓库所需的最小集合：
+
+- `contents: write`
+- `pull-requests: write`（仅 `branch-sync-pr.reusable.yml`）
+- `workflows: write`
+- `actions: read`
+
 ## 2. Inputs 说明
 
 | 名称 | 类型 | 必填 | 默认值 | 说明 |
@@ -191,7 +216,7 @@ jobs:
 ## 9. Fork Sync Reusable
 
 文件：`.github/workflows/fork-sync.reusable.yml`  
-用途：将 fork 的目标分支与上游分支做快进同步（仅允许 `--ff-only`）。
+用途：将 fork 的目标分支与上游分支做同步；默认使用 `--ff-only`，也支持显式强制重置。
 
 ### Inputs 说明
 
@@ -200,6 +225,7 @@ jobs:
 | `target_branch` | `string` | 否 | `main` | 当前仓库要同步的目标分支 |
 | `upstream_repo` | `string` | 是 | 无 | 上游仓库，格式 `owner/repo` |
 | `upstream_branch` | `string` | 否 | `main` | 上游分支 |
+| `force_reset` | `boolean` | 否 | `false` | 是否强制把目标分支重置到上游分支 |
 
 ### Outputs 说明
 
@@ -220,12 +246,17 @@ jobs:
       target_branch: main
       upstream_repo: upstream-owner/upstream-repo
       upstream_branch: main
+      force_reset: false
+    secrets:
+      GH_APP_ID: ${{ secrets.GH_APP_ID }}
+      GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
+      RUNNER_PROBE_TOKEN: ${{ secrets.RUNNER_PROBE_TOKEN }}
 ```
 
 ## 10. Branch Sync PR Reusable
 
 文件：`.github/workflows/branch-sync-pr.reusable.yml`  
-用途：比较 `target..source` 提交差异；有新增时检查是否已有 open PR，无则自动创建。
+用途：比较 `target..source` 提交差异；有新增时检查是否已有 open PR，无则通过 REST API 创建 PR。
 
 ### Inputs 说明
 
@@ -235,6 +266,7 @@ jobs:
 | `target_branch` | `string` | 否 | `custom/docker` | PR base 分支 |
 | `pr_title` | `string` | 否 | `chore(sync): merge main into custom/docker` | PR 标题 |
 | `pr_body` | `string` | 否 | 自动说明文本 | PR 描述 |
+| `auto_resolve_theirs_paths` | `string` | 否 | 空字符串 | 多行路径列表；发生冲突时这些路径自动采用 source(theirs) |
 
 ### Outputs 说明
 
@@ -256,6 +288,11 @@ jobs:
       target_branch: custom/docker
       pr_title: "chore(sync): merge main into custom/docker"
       pr_body: "自动同步分支变更并创建 PR。"
+      auto_resolve_theirs_paths: ""
+    secrets:
+      GH_APP_ID: ${{ secrets.GH_APP_ID }}
+      GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
+      RUNNER_PROBE_TOKEN: ${{ secrets.RUNNER_PROBE_TOKEN }}
 ```
 
 ## 11. Runner Fallback Reusable
