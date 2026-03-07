@@ -370,10 +370,9 @@ jobs:
                   wheel_url = f"{wheel_url}#sha256={final_sha256}"
 
                 command_parts = ["pip", "install"]
-                command_parts.extend(["--index-url", simple_url])
                 if trusted_host:
                   command_parts.extend(["--trusted-host", trusted_host])
-                command_parts.append(wheel_url)
+                command_parts.append(f"{package_name} @ {wheel_url}")
                 install_command = shlex.join(command_parts)
             except Exception:
               install_command = ""
