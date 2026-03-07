@@ -315,7 +315,7 @@ jobs:
           parse_shlex_args() {
             local raw_value="$1"
             GITHUB_WORKSPACE="${GITHUB_WORKSPACE}" \
-              "${python_bin}" -X utf8 -c 'import os, shlex, sys; raw = sys.argv[1].replace("__GITHUB_WORKSPACE__", os.environ.get("GITHUB_WORKSPACE", "")); print("\\n".join(shlex.split(raw)))' "${raw_value}"
+              "${python_bin}" -X utf8 -c 'import os, shlex, sys; raw = sys.argv[1].replace("__GITHUB_WORKSPACE__", os.environ.get("GITHUB_WORKSPACE", "")); print("\n".join(shlex.split(raw)))' "${raw_value}"
           }
 
           run_args=()
