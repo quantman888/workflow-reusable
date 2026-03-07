@@ -301,22 +301,34 @@ jobs:
 
           container_name="oci-gate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           timeout_seconds="${OCI_GATE_TIMEOUT_SECONDS:-60}"
+          python_bin="python"
+
+          if ! command -v "${python_bin}" >/dev/null 2>&1; then
+            python_bin="python3"
+          fi
+
+          if ! command -v "${python_bin}" >/dev/null 2>&1; then
+            echo "python or python3 is required for OCI gate argument parsing" >&2
+            exit 1
+          fi
 
           parse_shlex_args() {
             local raw_value="$1"
-            python -X utf8 -c 'import shlex, sys; print("\\n".join(shlex.split(sys.argv[1])))' "${raw_value}"
+            "${python_bin}" -X utf8 -c 'import shlex, sys; print("\\n".join(shlex.split(sys.argv[1])))' "${raw_value}"
           }
 
+          run_args=()
           if [[ -n "${OCI_GATE_RUN_ARGS}" ]]; then
-            mapfile -t run_args < <(parse_shlex_args "${OCI_GATE_RUN_ARGS}")
-          else
-            run_args=()
+            while IFS= read -r arg; do
+              run_args+=("${arg}")
+            done < <(parse_shlex_args "${OCI_GATE_RUN_ARGS}")
           fi
 
+          command_args=()
           if [[ -n "${OCI_GATE_COMMAND}" ]]; then
-            mapfile -t command_args < <(parse_shlex_args "${OCI_GATE_COMMAND}")
-          else
-            command_args=()
+            while IFS= read -r arg; do
+              command_args+=("${arg}")
+            done < <(parse_shlex_args "${OCI_GATE_COMMAND}")
           fi
 
           docker run -d --name "${container_name}" "${run_args[@]}" "${IMAGE_WITH_DIGEST}" "${command_args[@]}" >/dev/null
