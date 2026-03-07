@@ -81,6 +81,31 @@ on:
         required: false
         type: boolean
         default: false
+      OCI_UPLOAD_TRIVY_REPORT:
+        description: "Whether to upload the Trivy JSON report artifact"
+        required: false
+        type: boolean
+        default: false
+      PYTHON_PACKAGE_NAME:
+        description: "Optional Python package name for install summary"
+        required: false
+        type: string
+        default: ""
+      PYTHON_PACKAGE_SIMPLE_URL:
+        description: "Optional Python package simple index URL for install summary"
+        required: false
+        type: string
+        default: ""
+      PYTHON_PACKAGE_REPOSITORY_URL:
+        description: "Optional Python package repository URL for install summary"
+        required: false
+        type: string
+        default: ""
+      PYTHON_PACKAGE_TRUSTED_HOST:
+        description: "Optional trusted host used in Python package install summary"
+        required: false
+        type: string
+        default: ""
       RUNS_ON_JSON:
         description: "JSON value for runs-on (for example: \"ubuntu-latest\" or [\"self-hosted\",\"linux\"])"
         required: false
@@ -212,6 +237,9 @@ jobs:
 
       - name: Build and push image
         id: build
+        env:
+          DOCKER_BUILD_SUMMARY: "false"
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: ${{ inputs.OCI_BUILD_CONTEXT }}
@@ -243,25 +271,25 @@ jobs:
           IMAGE_TAGS: ${{ steps.tags.outputs.image_tags }}
           DIGEST: ${{ steps.build.outputs.digest }}
           IMAGE_WITH_DIGEST: ${{ steps.final_ref.outputs.image_with_digest }}
+          PYTHON_PACKAGE_NAME: ${{ inputs.PYTHON_PACKAGE_NAME }}
+          PYTHON_PACKAGE_SIMPLE_URL: ${{ inputs.PYTHON_PACKAGE_SIMPLE_URL }}
+          PYTHON_PACKAGE_REPOSITORY_URL: ${{ inputs.PYTHON_PACKAGE_REPOSITORY_URL }}
+          PYTHON_PACKAGE_TRUSTED_HOST: ${{ inputs.PYTHON_PACKAGE_TRUSTED_HOST }}
         run: |
           set -euo pipefail
 
-          {
-            echo "### Docker Publish Summary"
-            echo ""
-            echo "- push: \`${OCI_PUSH_IMAGE}\`"
-            echo "- publish_channel: \`${OCI_PUBLISH_CHANNEL}\`"
-            echo "- image_ref: \`${IMAGE_REF}\`"
+          publish_mode="dry-run"
+          if [[ "${OCI_PUSH_IMAGE}" == "true" ]]; then
+            publish_mode="push"
+          fi
 
-            if [[ -n "${IMAGE_TAGS}" ]]; then
-              echo "- published_tags:"
-              IFS=',' read -r -a tags <<< "${IMAGE_TAGS}"
-              for tag in "${tags[@]}"; do
-                echo "  - \`${IMAGE_REF}:${tag}\`"
-              done
-            else
-              echo "- published_tags: _none_"
-            fi
+          {
+            echo "### Published OCI Artifact"
+            echo ""
+            echo "- mode: \`${publish_mode}\`"
+            echo "- channel: \`${OCI_PUBLISH_CHANNEL}\`"
+            echo "- image: \`${IMAGE_REF}\`"
+            echo "- tags: \`${IMAGE_TAGS}\`"
 
             if [[ -n "${DIGEST}" ]]; then
               echo "- digest: \`${DIGEST}\`"
@@ -270,9 +298,24 @@ jobs:
             fi
 
             if [[ -n "${IMAGE_WITH_DIGEST}" ]]; then
-              echo "- image_with_digest: \`${IMAGE_WITH_DIGEST}\`"
-            else
-              echo "- image_with_digest: _not available_"
+              echo "- pull_by_digest: \`${IMAGE_WITH_DIGEST}\`"
+            fi
+
+            if [[ -n "${PYTHON_PACKAGE_NAME}" && -n "${PYTHON_PACKAGE_SIMPLE_URL}" ]]; then
+              install_cmd="pip install --upgrade ${PYTHON_PACKAGE_NAME} -i ${PYTHON_PACKAGE_SIMPLE_URL}"
+              if [[ -n "${PYTHON_PACKAGE_TRUSTED_HOST}" ]]; then
+                install_cmd="${install_cmd} --trusted-host ${PYTHON_PACKAGE_TRUSTED_HOST}"
+              fi
+
+              echo ""
+              echo "### Python Package Install"
+              echo ""
+              echo "- package: \`${PYTHON_PACKAGE_NAME}\`"
+              echo "- simple_index: \`${PYTHON_PACKAGE_SIMPLE_URL}\`"
+              if [[ -n "${PYTHON_PACKAGE_REPOSITORY_URL}" ]]; then
+                echo "- repository: \`${PYTHON_PACKAGE_REPOSITORY_URL}\`"
+              fi
+              echo "- pip_install: \`${install_cmd}\`"
             fi
           } >> "${GITHUB_STEP_SUMMARY}"
 
@@ -438,7 +481,7 @@ jobs:
           fi
 
       - name: Upload Trivy JSON report
-        if: ${{ always() }}
+        if: ${{ always() && inputs.OCI_UPLOAD_TRIVY_REPORT }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: trivy-image-report
@@ -448,7 +491,6 @@ jobs:
       - name: Gate summary
         if: ${{ always() }}
         env:
-          IMAGE_WITH_DIGEST: ${{ needs.docker_publish.outputs.image_with_digest }}
           STARTUP_OUTCOME: ${{ steps.startup.outcome }}
           HEALTH_OUTCOME: ${{ steps.health.outcome }}
           SMOKE_OUTCOME: ${{ steps.smoke.outcome }}
@@ -461,10 +503,9 @@ jobs:
           set -euo pipefail
 
           {
-            echo "### Docker Gate Summary"
+            echo "### Gate Checks"
             echo ""
-            echo "- image_with_digest: \`${IMAGE_WITH_DIGEST}\`"
-            echo "- startup_gate: \`${STARTUP_OUTCOME}\`"
+            echo "- startup: \`${STARTUP_OUTCOME}\`"
 
             if [[ -n "${OCI_GATE_HEALTH_URL}" ]]; then
               echo "- health_url: \`${OCI_GATE_HEALTH_URL}\`"
@@ -475,8 +516,8 @@ jobs:
               echo "- smoke_check: \`${SMOKE_OUTCOME}\`"
             fi
 
-            echo "- vuln_scan: \`${VULN_SCAN_OUTCOME}\`"
-            echo "- vuln_severity: \`${OCI_GATE_VULN_SEVERITY}\`"
+            echo "- vulnerability_scan: \`${VULN_SCAN_OUTCOME}\`"
+            echo "- severity: \`${OCI_GATE_VULN_SEVERITY}\`"
             echo "- ignore_unfixed: \`${OCI_GATE_VULN_IGNORE_UNFIXED}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
 
