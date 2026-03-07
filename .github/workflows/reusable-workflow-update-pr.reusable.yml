@@ -1,0 +1,299 @@
+name: Reusable Workflow Update PR Reusable
+
+on:
+  workflow_call:
+    inputs:
+      target_ref:
+        description: "Target reusable workflow ref (40-hex SHA or v* tag)"
+        required: false
+        type: string
+        default: ""
+      target_sha:
+        description: "Target reusable workflow commit SHA (40 hex)"
+        required: false
+        type: string
+        default: ""
+      target_tag:
+        description: "Target reusable workflow tag (v*)"
+        required: false
+        type: string
+        default: ""
+      reusable_repo:
+        description: "Reusable workflow repository (owner/repo)"
+        required: false
+        type: string
+        default: "quantman888/workflow-reusable"
+      reusable_workflow_path:
+        description: "Reusable workflow path in source repository"
+        required: false
+        type: string
+        default: ".github/workflows/docker-publish.reusable.yml"
+      source_repository:
+        description: "Dispatch source repository for audit trail"
+        required: false
+        type: string
+        default: ""
+    outputs:
+      changed:
+        description: "Whether workflow references changed"
+        value: ${{ jobs.update_reusable_workflow_ref.outputs.changed }}
+      branch:
+        description: "Branch used for the update PR"
+        value: ${{ jobs.update_reusable_workflow_ref.outputs.branch }}
+      pr_created:
+        description: "Whether a new PR was created"
+        value: ${{ jobs.update_reusable_workflow_ref.outputs.pr_created }}
+      pr_url:
+        description: "Open or reused PR URL"
+        value: ${{ jobs.update_reusable_workflow_ref.outputs.pr_url }}
+    secrets:
+      GH_APP_ID:
+        required: true
+      GH_APP_PRIVATE_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  update_reusable_workflow_ref:
+    name: Update Reusable Workflow Ref / Open PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      changed: ${{ steps.finalize.outputs.changed }}
+      branch: ${{ steps.finalize.outputs.branch }}
+      pr_created: ${{ steps.finalize.outputs.pr_created }}
+      pr_url: ${{ steps.finalize.outputs.pr_url }}
+    steps:
+      - name: Generate GitHub App token
+        id: app_token
+        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2
+        with:
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Resolve GitHub App bot identity
+        id: bot_identity
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          set -euo pipefail
+          app_slug="${{ steps.app_token.outputs.app-slug }}"
+          user_id="$(gh api "/users/${app_slug}[bot]" --jq '.id')"
+
+          {
+            echo "name=${app_slug}[bot]"
+            echo "email=${user_id}+${app_slug}[bot]@users.noreply.github.com"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app_token.outputs.token }}
+
+      - name: Resolve and validate update target
+        id: resolve
+        env:
+          INPUT_TARGET_REF: ${{ inputs.target_ref }}
+          INPUT_TARGET_SHA: ${{ inputs.target_sha }}
+          INPUT_TARGET_TAG: ${{ inputs.target_tag }}
+          INPUT_REUSABLE_REPO: ${{ inputs.reusable_repo }}
+          INPUT_REUSABLE_WORKFLOW_PATH: ${{ inputs.reusable_workflow_path }}
+          INPUT_SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+        run: |
+          set -euo pipefail
+
+          target_ref="${INPUT_TARGET_REF:-}"
+          if [[ -z "${target_ref}" && -n "${INPUT_TARGET_SHA:-}" ]]; then
+            target_ref="${INPUT_TARGET_SHA}"
+          fi
+          if [[ -z "${target_ref}" && -n "${INPUT_TARGET_TAG:-}" ]]; then
+            target_ref="${INPUT_TARGET_TAG}"
+          fi
+
+          if [[ -z "${target_ref}" ]]; then
+            echo "target_ref is required. Provide target_ref or target_sha/target_tag."
+            exit 1
+          fi
+
+          if [[ ! "${target_ref}" =~ ^[0-9a-fA-F]{40}$ && ! "${target_ref}" =~ ^v[0-9A-Za-z._-]+$ ]]; then
+            echo "Unsupported target_ref: ${target_ref}"
+            echo "Allowed formats: 40-hex SHA or v* tag."
+            exit 1
+          fi
+
+          reusable_repo="${INPUT_REUSABLE_REPO:-quantman888/workflow-reusable}"
+          reusable_workflow_path="${INPUT_REUSABLE_WORKFLOW_PATH:-.github/workflows/docker-publish.reusable.yml}"
+          source_repository="${INPUT_SOURCE_REPOSITORY:-}"
+          default_branch="${DEFAULT_BRANCH:-main}"
+
+          if [[ ! "${reusable_repo}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "Invalid reusable_repo: ${reusable_repo}"
+            exit 1
+          fi
+
+          if [[ ! "${reusable_workflow_path}" =~ ^\.github/workflows/[A-Za-z0-9._/-]+\.ya?ml$ ]]; then
+            echo "Invalid reusable_workflow_path: ${reusable_workflow_path}"
+            exit 1
+          fi
+
+          safe_ref="$(printf '%s' "${target_ref}" | sed 's#[^0-9A-Za-z._-]#-#g')"
+          short_ref="${safe_ref:0:24}"
+          branch="chore/reusable-workflow-ref-${short_ref}"
+
+          {
+            echo "target_ref=${target_ref}"
+            echo "reusable_repo=${reusable_repo}"
+            echo "reusable_workflow_path=${reusable_workflow_path}"
+            echo "source_repository=${source_repository}"
+            echo "default_branch=${default_branch}"
+            echo "branch=${branch}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Update reusable workflow references
+        id: update_refs
+        env:
+          TARGET_REF: ${{ steps.resolve.outputs.target_ref }}
+          REUSABLE_REPO: ${{ steps.resolve.outputs.reusable_repo }}
+          REUSABLE_WORKFLOW_PATH: ${{ steps.resolve.outputs.reusable_workflow_path }}
+        run: |
+          set -euo pipefail
+
+          escaped_repo="$(printf '%s' "${REUSABLE_REPO}" | sed 's/[.[\*^$()+?{|]/\\&/g')"
+          escaped_path="$(printf '%s' "${REUSABLE_WORKFLOW_PATH}" | sed 's/[.[\*^$()+?{|]/\\&/g')"
+          escaped_target_ref="$(printf '%s' "${TARGET_REF}" | sed 's/[\/&]/\\&/g')"
+
+          while IFS= read -r -d '' file; do
+            sed -E -i \
+              "s#(${escaped_repo}/${escaped_path})@[0-9A-Za-z._/-]+#\\1@${escaped_target_ref}#g" \
+              "${file}"
+          done < <(find ".github/workflows" -maxdepth 1 -type f \( -name "*.yml" -o -name "*.yaml" \) -print0 | sort -z)
+
+          if git diff --quiet -- ".github/workflows"; then
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "changed=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Commit and push update branch
+        if: steps.update_refs.outputs.changed == 'true'
+        id: push
+        env:
+          BRANCH: ${{ steps.resolve.outputs.branch }}
+          TARGET_REF: ${{ steps.resolve.outputs.target_ref }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "${{ steps.bot_identity.outputs.name }}"
+          git config user.email "${{ steps.bot_identity.outputs.email }}"
+
+          git checkout -B "${BRANCH}"
+          git add ".github/workflows"
+          git commit -m "chore(ci): bump reusable workflow ref to ${TARGET_REF}"
+          git push --force-with-lease --set-upstream origin "${BRANCH}"
+
+      - name: Open or reuse pull request
+        if: steps.update_refs.outputs.changed == 'true'
+        id: pr
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          BRANCH: ${{ steps.resolve.outputs.branch }}
+          DEFAULT_BRANCH: ${{ steps.resolve.outputs.default_branch }}
+          TARGET_REF: ${{ steps.resolve.outputs.target_ref }}
+          REUSABLE_REPO: ${{ steps.resolve.outputs.reusable_repo }}
+          REUSABLE_WORKFLOW_PATH: ${{ steps.resolve.outputs.reusable_workflow_path }}
+          SOURCE_REPOSITORY: ${{ steps.resolve.outputs.source_repository }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+
+          title="chore(ci): bump reusable workflow ref to ${TARGET_REF}"
+          body="$(cat <<EOF
+          Automated reusable workflow ref update.
+
+          - source_repository: ${SOURCE_REPOSITORY:-n/a}
+          - reusable_repo: ${REUSABLE_REPO}
+          - reusable_workflow_path: ${REUSABLE_WORKFLOW_PATH}
+          - target_ref: ${TARGET_REF}
+          EOF
+          )"
+          pr_head_ref="${REPOSITORY_OWNER}:${BRANCH}"
+
+          existing_pr_number="$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            "repos/${REPOSITORY}/pulls?state=open&base=${DEFAULT_BRANCH}&head=${pr_head_ref}" \
+            --jq '.[0].number // ""')"
+
+          if [[ -n "${existing_pr_number}" ]]; then
+            gh api \
+              --method PATCH \
+              -H 'Accept: application/vnd.github+json' \
+              "repos/${REPOSITORY}/pulls/${existing_pr_number}" \
+              -f title="${title}" \
+              -f body="${body}" >/dev/null
+            pr_url="$(gh api \
+              -H 'Accept: application/vnd.github+json' \
+              "repos/${REPOSITORY}/pulls/${existing_pr_number}" \
+              --jq '.html_url')"
+            {
+              echo "pr_created=false"
+              echo "pr_url=${pr_url}"
+            } >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          pr_url="$(gh api \
+            --method POST \
+            -H 'Accept: application/vnd.github+json' \
+            "repos/${REPOSITORY}/pulls" \
+            -f title="${title}" \
+            -f body="${body}" \
+            -f base="${DEFAULT_BRANCH}" \
+            -f head="${pr_head_ref}" \
+            --jq '.html_url')"
+
+          {
+            echo "pr_created=true"
+            echo "pr_url=${pr_url}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Finalize outputs
+        id: finalize
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+
+          changed="${{ steps.update_refs.outputs.changed || 'false' }}"
+          branch="${{ steps.resolve.outputs.branch || '' }}"
+          pr_created="${{ steps.pr.outputs.pr_created || 'false' }}"
+          pr_url="${{ steps.pr.outputs.pr_url || '' }}"
+
+          {
+            echo "changed=${changed}"
+            echo "branch=${branch}"
+            echo "pr_created=${pr_created}"
+            echo "pr_url=${pr_url}"
+          } >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "### Reusable Workflow Update PR"
+            echo ""
+            echo "- target_ref: \`${{ steps.resolve.outputs.target_ref }}\`"
+            echo "- changed: \`${changed}\`"
+            echo "- branch: \`${branch}\`"
+            if [[ -n "${pr_url}" ]]; then
+              echo "- pr_url: ${pr_url}"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"

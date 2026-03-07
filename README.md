@@ -6,6 +6,7 @@
 - `.github/workflows/docker-promote.reusable.yml`：按 digest 做发布标签提升
 - `.github/workflows/fork-sync.reusable.yml`：fork 分支快进同步
 - `.github/workflows/branch-sync-pr.reusable.yml`：分支差异检测并自动开 PR
+- `.github/workflows/reusable-workflow-update-pr.reusable.yml`：批量更新调用方仓库里的 reusable workflow 引用并开 PR
 - `.github/workflows/runner-fallback.reusable.yml`：先探测 self-hosted，再回退 github-hosted
 - `.github/workflows/github-app-secret-sync.controlplane.yml`：把 `GH_APP_*` 同步到 private repos 的公共控制面
 
@@ -75,6 +76,12 @@ jobs:
 - `contents: write`
 - `pull-requests: write`（仅 `branch-sync-pr.reusable.yml`）
 - `workflows: write`
+
+批量更新 workflow 引用并开 PR 的场景，也统一采用 GitHub App installation token：
+
+- 文件：`.github/workflows/reusable-workflow-update-pr.reusable.yml`
+- 作用：扫描调用方仓库 `.github/workflows` 中对中央 reusable 的引用，批量替换目标 ref，并用 App bot 推分支/开 PR
+- 适用：`workflow-reusable` 发布后，批量驱动各业务仓库 bump 到新的 SHA 或版本 tag
 
 ## 2. Inputs 说明
 
