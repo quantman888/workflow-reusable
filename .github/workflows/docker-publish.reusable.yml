@@ -86,26 +86,6 @@ on:
         required: false
         type: boolean
         default: false
-      PYTHON_PACKAGE_NAME:
-        description: "Optional Python package name for install summary"
-        required: false
-        type: string
-        default: ""
-      PYTHON_PACKAGE_SIMPLE_URL:
-        description: "Optional Python package simple index URL for install summary"
-        required: false
-        type: string
-        default: ""
-      PYTHON_PACKAGE_REPOSITORY_URL:
-        description: "Optional Python package repository URL for install summary"
-        required: false
-        type: string
-        default: ""
-      PYTHON_PACKAGE_TRUSTED_HOST:
-        description: "Optional trusted host used in Python package install summary"
-        required: false
-        type: string
-        default: ""
       RUNS_ON_JSON:
         description: "JSON value for runs-on (for example: \"ubuntu-latest\" or [\"self-hosted\",\"linux\"])"
         required: false
@@ -266,15 +246,9 @@ jobs:
         if: ${{ always() }}
         env:
           OCI_PUSH_IMAGE: ${{ inputs.OCI_PUSH_IMAGE }}
-          OCI_PUBLISH_CHANNEL: ${{ inputs.OCI_PUBLISH_CHANNEL }}
           IMAGE_REF: ${{ steps.tags.outputs.image_ref }}
           IMAGE_TAGS: ${{ steps.tags.outputs.image_tags }}
-          DIGEST: ${{ steps.build.outputs.digest }}
           IMAGE_WITH_DIGEST: ${{ steps.final_ref.outputs.image_with_digest }}
-          PYTHON_PACKAGE_NAME: ${{ inputs.PYTHON_PACKAGE_NAME }}
-          PYTHON_PACKAGE_SIMPLE_URL: ${{ inputs.PYTHON_PACKAGE_SIMPLE_URL }}
-          PYTHON_PACKAGE_REPOSITORY_URL: ${{ inputs.PYTHON_PACKAGE_REPOSITORY_URL }}
-          PYTHON_PACKAGE_TRUSTED_HOST: ${{ inputs.PYTHON_PACKAGE_TRUSTED_HOST }}
         run: |
           set -euo pipefail
 
@@ -287,35 +261,11 @@ jobs:
             echo "### Published OCI Artifact"
             echo ""
             echo "- mode: \`${publish_mode}\`"
-            echo "- channel: \`${OCI_PUBLISH_CHANNEL}\`"
             echo "- image: \`${IMAGE_REF}\`"
-            echo "- tags: \`${IMAGE_TAGS}\`"
-
-            if [[ -n "${DIGEST}" ]]; then
-              echo "- digest: \`${DIGEST}\`"
-            else
-              echo "- digest: _not available_"
-            fi
+            echo "- published_tags: \`${IMAGE_TAGS}\`"
 
             if [[ -n "${IMAGE_WITH_DIGEST}" ]]; then
-              echo "- pull_by_digest: \`${IMAGE_WITH_DIGEST}\`"
-            fi
-
-            if [[ -n "${PYTHON_PACKAGE_NAME}" && -n "${PYTHON_PACKAGE_SIMPLE_URL}" ]]; then
-              install_cmd="pip install --upgrade ${PYTHON_PACKAGE_NAME} -i ${PYTHON_PACKAGE_SIMPLE_URL}"
-              if [[ -n "${PYTHON_PACKAGE_TRUSTED_HOST}" ]]; then
-                install_cmd="${install_cmd} --trusted-host ${PYTHON_PACKAGE_TRUSTED_HOST}"
-              fi
-
-              echo ""
-              echo "### Python Package Install"
-              echo ""
-              echo "- package: \`${PYTHON_PACKAGE_NAME}\`"
-              echo "- simple_index: \`${PYTHON_PACKAGE_SIMPLE_URL}\`"
-              if [[ -n "${PYTHON_PACKAGE_REPOSITORY_URL}" ]]; then
-                echo "- repository: \`${PYTHON_PACKAGE_REPOSITORY_URL}\`"
-              fi
-              echo "- pip_install: \`${install_cmd}\`"
+              echo "- image_with_digest: \`${IMAGE_WITH_DIGEST}\`"
             fi
           } >> "${GITHUB_STEP_SUMMARY}"
 
@@ -448,7 +398,7 @@ jobs:
             "${IMAGE_WITH_DIGEST}"
 
       - name: Generate Trivy JSON report
-        if: ${{ always() }}
+        if: ${{ always() && inputs.OCI_UPLOAD_TRIVY_REPORT }}
         env:
           IMAGE_WITH_DIGEST: ${{ needs.docker_publish.outputs.image_with_digest }}
           OCI_GATE_VULN_SEVERITY: ${{ inputs.OCI_GATE_VULN_SEVERITY }}
@@ -497,8 +447,6 @@ jobs:
           VULN_SCAN_OUTCOME: ${{ steps.vuln_scan.outcome }}
           OCI_GATE_HEALTH_URL: ${{ inputs.OCI_GATE_HEALTH_URL }}
           OCI_GATE_SMOKE_CMD: ${{ inputs.OCI_GATE_SMOKE_CMD }}
-          OCI_GATE_VULN_SEVERITY: ${{ inputs.OCI_GATE_VULN_SEVERITY }}
-          OCI_GATE_VULN_IGNORE_UNFIXED: ${{ inputs.OCI_GATE_VULN_IGNORE_UNFIXED }}
         run: |
           set -euo pipefail
 
@@ -508,7 +456,6 @@ jobs:
             echo "- startup: \`${STARTUP_OUTCOME}\`"
 
             if [[ -n "${OCI_GATE_HEALTH_URL}" ]]; then
-              echo "- health_url: \`${OCI_GATE_HEALTH_URL}\`"
               echo "- health_check: \`${HEALTH_OUTCOME}\`"
             fi
 
@@ -517,8 +464,6 @@ jobs:
             fi
 
             echo "- vulnerability_scan: \`${VULN_SCAN_OUTCOME}\`"
-            echo "- severity: \`${OCI_GATE_VULN_SEVERITY}\`"
-            echo "- ignore_unfixed: \`${OCI_GATE_VULN_IGNORE_UNFIXED}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Cleanup gate container

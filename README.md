@@ -3,6 +3,7 @@
 该仓库提供可复用工作流，当前包含：
 
 - `.github/workflows/docker-publish.reusable.yml`：Docker 镜像构建发布 + 中环门禁
+- `.github/workflows/python-package-publish.reusable.yml`：Python 包构建发布 + Nexus 安装摘要
 - `.github/workflows/docker-promote.reusable.yml`：按 digest 做发布标签提升
 - `.github/workflows/fork-sync.reusable.yml`：fork 分支快进同步
 - `.github/workflows/branch-sync-pr.reusable.yml`：分支差异检测并自动开 PR
@@ -251,6 +252,36 @@ jobs:
   - `NEXUS_PASSWORD`
 
 然后在 caller workflow 里映射到 reusable workflow 的 `with` / `secrets`。
+
+## 8.1 Python Package Publish Reusable
+
+文件：`.github/workflows/python-package-publish.reusable.yml`  
+用途：基于当前仓库源码构建 wheel/sdist，按显式开关上传到 Nexus PyPI，并在 run summary 输出安装命令。  
+变更策略：Python 包发布与 OCI 发布完全解耦；是否发布由 caller workflow 的显式 job/checkbox 决定，不做仓库智能识别。
+
+### 调用示例（caller）
+
+```yaml
+jobs:
+  python-package-publish:
+    uses: <owner>/workflow-reusable/.github/workflows/python-package-publish.reusable.yml@<pinned-ref>
+    with:
+      PYTHON_PACKAGE_REPOSITORY_URL: ${{ vars.NEXUS_PYPI_REPOSITORY_URL }}
+      PYTHON_PACKAGE_SIMPLE_URL: ${{ vars.NEXUS_PYPI_SIMPLE_URL || '' }}
+      PYTHON_PACKAGE_TRUSTED_HOST: ${{ vars.NEXUS_PYPI_TRUSTED_HOST || '' }}
+      PYTHON_PUSH_PACKAGE: true
+      PYTHON_SKIP_EXISTING: true
+    secrets:
+      nexus_username: ${{ secrets.NEXUS_USERNAME }}
+      nexus_password: ${{ secrets.NEXUS_PASSWORD }}
+```
+
+### 关键约定
+
+- 包名与版本从构建产物元数据解析，不要求 caller 额外传入。
+- `PYTHON_PUSH_PACKAGE=false` 时仍会构建并输出元数据，但不会上传。
+- `PYTHON_SKIP_EXISTING=true` 时使用 `twine upload --skip-existing`，适合重复发布验证与幂等重跑。
+- 仅当 `PYTHON_PACKAGE_SIMPLE_URL` 非空时，summary 才输出 `pip install` 安装命令。
 
 ## 9. Fork Sync Reusable
 

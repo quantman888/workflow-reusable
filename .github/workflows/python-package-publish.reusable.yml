@@ -1,0 +1,231 @@
+name: Python Package Publish Reusable Workflow
+
+on:
+  workflow_call:
+    inputs:
+      PYTHON_PACKAGE_REPOSITORY_URL:
+        description: "Repository URL used by twine upload"
+        required: true
+        type: string
+      PYTHON_PACKAGE_SIMPLE_URL:
+        description: "Optional simple index URL used in install summary"
+        required: false
+        type: string
+        default: ""
+      PYTHON_PACKAGE_TRUSTED_HOST:
+        description: "Optional trusted host appended to pip install summary"
+        required: false
+        type: string
+        default: ""
+      PYTHON_PUSH_PACKAGE:
+        description: "Whether to upload built distributions"
+        required: false
+        type: boolean
+        default: true
+      PYTHON_SKIP_EXISTING:
+        description: "Whether twine upload should skip existing files"
+        required: false
+        type: boolean
+        default: true
+      PYTHON_VERSION:
+        description: "Python version used for build/upload"
+        required: false
+        type: string
+        default: "3.x"
+      RUNS_ON_JSON:
+        description: "JSON value for runs-on (for example: \"ubuntu-latest\" or [\"self-hosted\",\"linux\"])"
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
+    outputs:
+      package_name:
+        description: "Resolved Python package name from built metadata"
+        value: ${{ jobs.python_package_publish.outputs.package_name }}
+      package_version:
+        description: "Resolved Python package version from built metadata"
+        value: ${{ jobs.python_package_publish.outputs.package_version }}
+      dist_files:
+        description: "Built distribution filenames as comma-separated list"
+        value: ${{ jobs.python_package_publish.outputs.dist_files }}
+      upload_result:
+        description: "Upload result: uploaded|skipped-existing|mixed|dry-run"
+        value: ${{ jobs.python_package_publish.outputs.upload_result }}
+      install_command:
+        description: "Suggested pip install command when simple index is configured"
+        value: ${{ jobs.python_package_publish.outputs.install_command }}
+    secrets:
+      nexus_username:
+        required: false
+      nexus_password:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  python_package_publish:
+    name: Build And Publish Python Package
+    runs-on: ${{ fromJSON(inputs.RUNS_ON_JSON) }}
+    timeout-minutes: 20
+    outputs:
+      package_name: ${{ steps.metadata.outputs.package_name }}
+      package_version: ${{ steps.metadata.outputs.package_version }}
+      dist_files: ${{ steps.metadata.outputs.dist_files }}
+      upload_result: ${{ steps.publish.outputs.upload_result }}
+      install_command: ${{ steps.install_cmd.outputs.install_command }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ inputs.PYTHON_VERSION }}
+
+      - name: Install build tooling
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: |
+          set -euo pipefail
+          python -X utf8 -m pip install --upgrade pip
+          python -X utf8 -m pip install --upgrade build twine
+
+      - name: Build distributions
+        run: |
+          set -euo pipefail
+          rm -rf build dist *.egg-info
+          python -X utf8 -m build --sdist --wheel
+
+      - name: Resolve package metadata
+        id: metadata
+        run: |
+          set -euo pipefail
+          python -X utf8 <<'PY'
+          import email
+          import os
+          import pathlib
+          import zipfile
+
+          output_path = pathlib.Path(os.environ["GITHUB_OUTPUT"])
+          dist_dir = pathlib.Path("dist")
+          wheels = sorted(dist_dir.glob("*.whl"))
+          if not wheels:
+            raise SystemExit("no wheel file found in dist/")
+
+          wheel_path = wheels[0]
+          with zipfile.ZipFile(wheel_path) as zf:
+            metadata_name = next(
+              name for name in zf.namelist() if name.endswith(".dist-info/METADATA")
+            )
+            metadata = email.message_from_bytes(zf.read(metadata_name))
+
+          package_name = metadata.get("Name", "").strip()
+          package_version = metadata.get("Version", "").strip()
+          if not package_name or not package_version:
+            raise SystemExit("failed to resolve package name/version from wheel metadata")
+
+          dist_files = sorted(path.name for path in dist_dir.iterdir() if path.is_file())
+          with output_path.open("a", encoding="utf-8") as fh:
+            fh.write(f"package_name={package_name}\n")
+            fh.write(f"package_version={package_version}\n")
+            fh.write(f"dist_files={','.join(dist_files)}\n")
+          PY
+
+      - name: Build install command
+        id: install_cmd
+        env:
+          PACKAGE_NAME: ${{ steps.metadata.outputs.package_name }}
+          PYTHON_PACKAGE_SIMPLE_URL: ${{ inputs.PYTHON_PACKAGE_SIMPLE_URL }}
+          PYTHON_PACKAGE_TRUSTED_HOST: ${{ inputs.PYTHON_PACKAGE_TRUSTED_HOST }}
+        run: |
+          set -euo pipefail
+
+          install_command=""
+          if [[ -n "${PACKAGE_NAME}" && -n "${PYTHON_PACKAGE_SIMPLE_URL}" ]]; then
+            install_command="pip install --upgrade ${PACKAGE_NAME} -i ${PYTHON_PACKAGE_SIMPLE_URL}"
+            if [[ -n "${PYTHON_PACKAGE_TRUSTED_HOST}" ]]; then
+              install_command="${install_command} --trusted-host ${PYTHON_PACKAGE_TRUSTED_HOST}"
+            fi
+          fi
+
+          echo "install_command=${install_command}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload distributions
+        id: publish
+        env:
+          PYTHON_PUSH_PACKAGE: ${{ inputs.PYTHON_PUSH_PACKAGE }}
+          PYTHON_SKIP_EXISTING: ${{ inputs.PYTHON_SKIP_EXISTING }}
+          PYTHON_PACKAGE_REPOSITORY_URL: ${{ inputs.PYTHON_PACKAGE_REPOSITORY_URL }}
+          TWINE_USERNAME: ${{ secrets.nexus_username }}
+          TWINE_PASSWORD: ${{ secrets.nexus_password }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${PYTHON_PUSH_PACKAGE}" != "true" ]]; then
+            echo "upload_result=dry-run" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          extra_args=()
+          if [[ "${PYTHON_SKIP_EXISTING}" == "true" ]]; then
+            extra_args+=(--skip-existing)
+          fi
+
+          upload_log="$(mktemp)"
+          trap 'rm -f "${upload_log}"' EXIT
+
+          python -X utf8 -m twine upload \
+            --repository-url "${PYTHON_PACKAGE_REPOSITORY_URL}" \
+            "${extra_args[@]}" \
+            dist/* 2>&1 | tee "${upload_log}"
+
+          if grep -q "^Skipping " "${upload_log}" && grep -q "^Uploading " "${upload_log}"; then
+            upload_result="mixed"
+          elif grep -q "^Skipping " "${upload_log}"; then
+            upload_result="skipped-existing"
+          else
+            upload_result="uploaded"
+          fi
+
+          echo "upload_result=${upload_result}" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish summary
+        if: ${{ always() }}
+        env:
+          PYTHON_PUSH_PACKAGE: ${{ inputs.PYTHON_PUSH_PACKAGE }}
+          PYTHON_PACKAGE_REPOSITORY_URL: ${{ inputs.PYTHON_PACKAGE_REPOSITORY_URL }}
+          PYTHON_PACKAGE_SIMPLE_URL: ${{ inputs.PYTHON_PACKAGE_SIMPLE_URL }}
+          PACKAGE_NAME: ${{ steps.metadata.outputs.package_name }}
+          PACKAGE_VERSION: ${{ steps.metadata.outputs.package_version }}
+          DIST_FILES: ${{ steps.metadata.outputs.dist_files }}
+          UPLOAD_RESULT: ${{ steps.publish.outputs.upload_result }}
+          INSTALL_COMMAND: ${{ steps.install_cmd.outputs.install_command }}
+        run: |
+          set -euo pipefail
+
+          publish_mode="dry-run"
+          if [[ "${PYTHON_PUSH_PACKAGE}" == "true" ]]; then
+            publish_mode="push"
+          fi
+
+          {
+            echo "### Published Python Package"
+            echo ""
+            echo "- mode: \`${publish_mode}\`"
+            echo "- result: \`${UPLOAD_RESULT:-unknown}\`"
+            echo "- package: \`${PACKAGE_NAME}\`"
+            echo "- version: \`${PACKAGE_VERSION}\`"
+            echo "- files: \`${DIST_FILES}\`"
+            echo "- repository: \`${PYTHON_PACKAGE_REPOSITORY_URL}\`"
+
+            if [[ -n "${PYTHON_PACKAGE_SIMPLE_URL}" ]]; then
+              echo "- simple_index: \`${PYTHON_PACKAGE_SIMPLE_URL}\`"
+            fi
+
+            if [[ -n "${INSTALL_COMMAND}" ]]; then
+              echo "- pip_install: \`${INSTALL_COMMAND}\`"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
