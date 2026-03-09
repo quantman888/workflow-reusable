@@ -1,0 +1,474 @@
+name: Config Drift SSH Reusable
+
+on:
+  workflow_call:
+    inputs:
+      RUNS_ON_JSON:
+        description: "Runner selector JSON, for example \"ubuntu-latest\" or [\"self-hosted\",\"linux\",\"x64\"]"
+        required: true
+        type: string
+      SSH_HOST:
+        description: "Remote SSH host"
+        required: true
+        type: string
+      SSH_PORT:
+        description: "Remote SSH port"
+        required: false
+        type: string
+        default: "22"
+      SSH_USER:
+        description: "Remote SSH user"
+        required: true
+        type: string
+      SSH_CONNECT_TIMEOUT_SECONDS:
+        description: "SSH connect timeout in seconds"
+        required: false
+        type: string
+        default: "20"
+      DRIFT_FILE_MAP:
+        description: "Newline-delimited local_path::remote_path entries"
+        required: true
+        type: string
+      DRIFT_ARTIFACT_NAME:
+        description: "Artifact name for drift report"
+        required: false
+        type: string
+        default: "config-drift-report"
+      MAIL_TO:
+        description: "Comma-separated alert recipients. Leave empty to disable email."
+        required: false
+        type: string
+        default: ""
+      MAIL_FROM:
+        description: "Alert sender address"
+        required: false
+        type: string
+        default: ""
+      MAIL_SUBJECT_PREFIX:
+        description: "Alert email subject prefix"
+        required: false
+        type: string
+        default: "[Config Drift]"
+      MAIL_SMTP_HOST:
+        description: "SMTP host"
+        required: false
+        type: string
+        default: ""
+      MAIL_SMTP_PORT:
+        description: "SMTP port"
+        required: false
+        type: string
+        default: "587"
+      MAIL_SMTP_STARTTLS:
+        description: "Whether to use STARTTLS on plain SMTP"
+        required: false
+        type: string
+        default: "true"
+      MAIL_SMTP_SSL:
+        description: "Whether to use implicit SSL SMTP"
+        required: false
+        type: string
+        default: "false"
+    secrets:
+      ssh_private_key:
+        required: true
+      ssh_known_hosts:
+        required: true
+      mail_smtp_username:
+        required: false
+      mail_smtp_password:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  drift_check:
+    name: Config Drift / Compare
+    runs-on: ${{ fromJSON(inputs.RUNS_ON_JSON) }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      drift_detected: ${{ steps.compare.outputs.drift_detected }}
+      checked_count: ${{ steps.compare.outputs.checked_count }}
+      mismatch_count: ${{ steps.compare.outputs.mismatch_count }}
+      error_count: ${{ steps.compare.outputs.error_count }}
+      artifact_name: ${{ steps.compare.outputs.artifact_name }}
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Prepare SSH material
+        id: prepare
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.ssh_private_key }}
+          SSH_KNOWN_HOSTS: ${{ secrets.ssh_known_hosts }}
+        run: |
+          set -euo pipefail
+
+          workdir="${RUNNER_TEMP}/config-drift"
+          artifact_dir="${workdir}/artifact"
+          mkdir -p "${artifact_dir}"
+
+          ssh_key_file="${workdir}/id_ssh"
+          ssh_known_hosts_file="${workdir}/known_hosts"
+
+          printf '%s\n' "${SSH_PRIVATE_KEY}" > "${ssh_key_file}"
+          printf '%s\n' "${SSH_KNOWN_HOSTS}" > "${ssh_known_hosts_file}"
+
+          chmod 600 "${ssh_key_file}" "${ssh_known_hosts_file}"
+
+          {
+            echo "workdir=${workdir}"
+            echo "artifact_dir=${artifact_dir}"
+            echo "ssh_key_file=${ssh_key_file}"
+            echo "ssh_known_hosts_file=${ssh_known_hosts_file}"
+            echo "summary_md=${artifact_dir}/summary.md"
+            echo "result_json=${artifact_dir}/result.json"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Compare local SSOT against remote files
+        id: compare
+        env:
+          DRIFT_FILE_MAP: ${{ inputs.DRIFT_FILE_MAP }}
+          DRIFT_ARTIFACT_NAME: ${{ inputs.DRIFT_ARTIFACT_NAME }}
+          SSH_HOST: ${{ inputs.SSH_HOST }}
+          SSH_PORT: ${{ inputs.SSH_PORT }}
+          SSH_USER: ${{ inputs.SSH_USER }}
+          SSH_CONNECT_TIMEOUT_SECONDS: ${{ inputs.SSH_CONNECT_TIMEOUT_SECONDS }}
+          SSH_KEY_FILE: ${{ steps.prepare.outputs.ssh_key_file }}
+          SSH_KNOWN_HOSTS_FILE: ${{ steps.prepare.outputs.ssh_known_hosts_file }}
+          DRIFT_ARTIFACT_DIR: ${{ steps.prepare.outputs.artifact_dir }}
+          DRIFT_SUMMARY_MD: ${{ steps.prepare.outputs.summary_md }}
+          DRIFT_RESULT_JSON: ${{ steps.prepare.outputs.result_json }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "${DRIFT_ARTIFACT_DIR}/remote" "${DRIFT_ARTIFACT_DIR}/diff"
+
+          python3 - <<'PY'
+          import difflib
+          import hashlib
+          import json
+          import os
+          import re
+          import shlex
+          import subprocess
+          from pathlib import Path
+
+          repo_root = Path(os.environ["GITHUB_WORKSPACE"])
+          artifact_dir = Path(os.environ["DRIFT_ARTIFACT_DIR"])
+          remote_dir = artifact_dir / "remote"
+          diff_dir = artifact_dir / "diff"
+          summary_md = Path(os.environ["DRIFT_SUMMARY_MD"])
+          result_json = Path(os.environ["DRIFT_RESULT_JSON"])
+
+          ssh_host = os.environ["SSH_HOST"].strip()
+          ssh_port = os.environ["SSH_PORT"].strip()
+          ssh_user = os.environ["SSH_USER"].strip()
+          ssh_timeout = os.environ["SSH_CONNECT_TIMEOUT_SECONDS"].strip()
+          ssh_key_file = os.environ["SSH_KEY_FILE"]
+          ssh_known_hosts_file = os.environ["SSH_KNOWN_HOSTS_FILE"]
+          drift_file_map = os.environ["DRIFT_FILE_MAP"]
+          artifact_name = os.environ["DRIFT_ARTIFACT_NAME"].strip() or "config-drift-report"
+
+          mismatch_count = 0
+          error_count = 0
+          checked_count = 0
+          items = []
+
+          def sha256_bytes(payload: bytes) -> str:
+              return hashlib.sha256(payload).hexdigest()
+
+          def sanitize_file_name(prefix: str, path_value: str, suffix: str) -> str:
+              safe = re.sub(r"[^A-Za-z0-9._-]+", "_", path_value).strip("_")
+              if not safe:
+                  safe = "item"
+              return f"{prefix}_{safe}{suffix}"
+
+          for raw_line in drift_file_map.splitlines():
+              line = raw_line.strip()
+              if not line or line.startswith("#"):
+                  continue
+
+              local_part, separator, remote_part = line.partition("::")
+              local_rel = local_part.strip()
+              remote_path = remote_part.strip()
+
+              item = {
+                  "mapping": line,
+                  "local_path": local_rel,
+                  "remote_path": remote_path,
+              }
+
+              if separator != "::" or not local_rel or not remote_path:
+                  error_count += 1
+                  item["status"] = "invalid_mapping"
+                  item["message"] = "mapping must use local_path::remote_path"
+                  items.append(item)
+                  continue
+
+              checked_count += 1
+              local_path = repo_root / local_rel
+              if not local_path.is_file():
+                  error_count += 1
+                  item["status"] = "local_missing"
+                  item["message"] = "local file not found"
+                  items.append(item)
+                  continue
+
+              ssh_command = [
+                  "ssh",
+                  "-i",
+                  ssh_key_file,
+                  "-o",
+                  f"UserKnownHostsFile={ssh_known_hosts_file}",
+                  "-o",
+                  "StrictHostKeyChecking=yes",
+                  "-o",
+                  "BatchMode=yes",
+                  "-o",
+                  f"ConnectTimeout={ssh_timeout}",
+                  "-p",
+                  ssh_port,
+                  f"{ssh_user}@{ssh_host}",
+                  f"cat {shlex.quote(remote_path)}",
+              ]
+              completed = subprocess.run(ssh_command, capture_output=True, text=False)
+              if completed.returncode != 0:
+                  error_count += 1
+                  item["status"] = "remote_fetch_failed"
+                  item["message"] = completed.stderr.decode("utf-8", "replace").strip() or "ssh fetch failed"
+                  items.append(item)
+                  continue
+
+              local_bytes = local_path.read_bytes()
+              remote_bytes = completed.stdout
+              item["local_sha256"] = sha256_bytes(local_bytes)
+              item["remote_sha256"] = sha256_bytes(remote_bytes)
+
+              remote_copy_path = remote_dir / sanitize_file_name(str(checked_count).zfill(2), remote_path, ".remote")
+              remote_copy_path.write_bytes(remote_bytes)
+              item["remote_copy"] = str(remote_copy_path.relative_to(artifact_dir))
+
+              if local_bytes == remote_bytes:
+                  item["status"] = "match"
+                  items.append(item)
+                  continue
+
+              mismatch_count += 1
+              item["status"] = "mismatch"
+              diff_text = "".join(
+                  difflib.unified_diff(
+                      local_bytes.decode("utf-8", "replace").splitlines(True),
+                      remote_bytes.decode("utf-8", "replace").splitlines(True),
+                      fromfile=f"repo/{local_rel}",
+                      tofile=f"remote/{remote_path}",
+                  )
+              )
+              if not diff_text:
+                  diff_text = "[binary-or-encoding-difference]\n"
+
+              diff_path = diff_dir / sanitize_file_name(str(checked_count).zfill(2), local_rel, ".diff")
+              diff_path.write_text(diff_text, encoding="utf-8")
+              item["diff_file"] = str(diff_path.relative_to(artifact_dir))
+              items.append(item)
+
+          drift_detected = mismatch_count > 0 or error_count > 0
+
+          summary_lines = [
+              "# Config Drift Summary",
+              "",
+              f"- remote: `{ssh_user}@{ssh_host}:{ssh_port}`",
+              f"- checked_count: `{checked_count}`",
+              f"- mismatch_count: `{mismatch_count}`",
+              f"- error_count: `{error_count}`",
+              f"- drift_detected: `{str(drift_detected).lower()}`",
+              "",
+          ]
+
+          if items:
+              summary_lines.append("## Item Results")
+              summary_lines.append("")
+              for item in items:
+                  summary_lines.append(
+                      f"- `{item.get('status', 'unknown')}` {item.get('local_path', '')} :: {item.get('remote_path', '')}"
+                  )
+                  if item.get("message"):
+                      summary_lines.append(f"  - message: `{item['message']}`")
+                  if item.get("local_sha256") and item.get("remote_sha256"):
+                      summary_lines.append(f"  - local_sha256: `{item['local_sha256']}`")
+                      summary_lines.append(f"  - remote_sha256: `{item['remote_sha256']}`")
+                  if item.get("diff_file"):
+                      summary_lines.append(f"  - diff: `{item['diff_file']}`")
+                  if item.get("remote_copy"):
+                      summary_lines.append(f"  - remote_copy: `{item['remote_copy']}`")
+              summary_lines.append("")
+
+          result = {
+              "drift_detected": drift_detected,
+              "checked_count": checked_count,
+              "mismatch_count": mismatch_count,
+              "error_count": error_count,
+              "artifact_name": artifact_name,
+              "items": items,
+          }
+
+          summary_md.write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+          result_json.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+          PY
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          result = json.loads(Path(os.environ["DRIFT_RESULT_JSON"]).read_text(encoding="utf-8"))
+          outputs = {
+              "drift_detected": str(result["drift_detected"]).lower(),
+              "checked_count": str(result["checked_count"]),
+              "mismatch_count": str(result["mismatch_count"]),
+              "error_count": str(result["error_count"]),
+              "artifact_name": result["artifact_name"],
+          }
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              for key, value in outputs.items():
+                  handle.write(f"{key}={value}\n")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
+              handle.write(Path(os.environ["DRIFT_SUMMARY_MD"]).read_text(encoding="utf-8"))
+          PY
+
+      - name: Upload drift artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.compare.outputs.artifact_name }}
+          path: ${{ steps.prepare.outputs.artifact_dir }}
+          if-no-files-found: error
+          retention-days: 14
+
+  notify_email:
+    name: Config Drift / Notify Email
+    if: ${{ always() && needs.drift_check.outputs.drift_detected == 'true' && inputs.MAIL_TO != '' }}
+    needs: [drift_check]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Download drift artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.drift_check.outputs.artifact_name }}
+          path: ${{ runner.temp }}/config-drift-mail
+
+      - name: Send alert email
+        env:
+          MAIL_TO: ${{ inputs.MAIL_TO }}
+          MAIL_FROM: ${{ inputs.MAIL_FROM }}
+          MAIL_SUBJECT_PREFIX: ${{ inputs.MAIL_SUBJECT_PREFIX }}
+          MAIL_SMTP_HOST: ${{ inputs.MAIL_SMTP_HOST }}
+          MAIL_SMTP_PORT: ${{ inputs.MAIL_SMTP_PORT }}
+          MAIL_SMTP_STARTTLS: ${{ inputs.MAIL_SMTP_STARTTLS }}
+          MAIL_SMTP_SSL: ${{ inputs.MAIL_SMTP_SSL }}
+          MAIL_SMTP_USERNAME: ${{ secrets.mail_smtp_username }}
+          MAIL_SMTP_PASSWORD: ${{ secrets.mail_smtp_password }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_WORKFLOW: ${{ github.workflow }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import os
+          import smtplib
+          import ssl
+          from email.message import EmailMessage
+          from pathlib import Path
+
+          def to_bool(raw: str) -> bool:
+              return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+          required = {
+              "MAIL_FROM": os.environ.get("MAIL_FROM", "").strip(),
+              "MAIL_SMTP_HOST": os.environ.get("MAIL_SMTP_HOST", "").strip(),
+              "MAIL_SMTP_PORT": os.environ.get("MAIL_SMTP_PORT", "").strip(),
+              "MAIL_SMTP_USERNAME": os.environ.get("MAIL_SMTP_USERNAME", "").strip(),
+              "MAIL_SMTP_PASSWORD": os.environ.get("MAIL_SMTP_PASSWORD", "").strip(),
+          }
+          missing = [name for name, value in required.items() if not value]
+          if missing:
+              raise SystemExit(f"missing mail configuration: {', '.join(missing)}")
+
+          summary_path = Path(os.environ["RUNNER_TEMP"]) / "config-drift-mail" / "summary.md"
+          summary_text = summary_path.read_text(encoding="utf-8") if summary_path.exists() else "(missing summary.md)"
+          run_url = f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          subject = f"{os.environ['MAIL_SUBJECT_PREFIX'].strip() or '[Config Drift]'} {os.environ['GITHUB_REPOSITORY']} drift detected"
+          body = "\n".join(
+              [
+                  f"workflow: {os.environ['GITHUB_WORKFLOW']}",
+                  f"repository: {os.environ['GITHUB_REPOSITORY']}",
+                  f"run_url: {run_url}",
+                  "",
+                  summary_text,
+              ]
+          )
+
+          message = EmailMessage()
+          message["Subject"] = subject
+          message["From"] = os.environ["MAIL_FROM"].strip()
+          message["To"] = os.environ["MAIL_TO"].strip()
+          message.set_content(body)
+
+          smtp_host = os.environ["MAIL_SMTP_HOST"].strip()
+          smtp_port = int(os.environ["MAIL_SMTP_PORT"].strip())
+          smtp_username = os.environ["MAIL_SMTP_USERNAME"].strip()
+          smtp_password = os.environ["MAIL_SMTP_PASSWORD"].strip()
+          use_ssl = to_bool(os.environ.get("MAIL_SMTP_SSL", "false"))
+          use_starttls = to_bool(os.environ.get("MAIL_SMTP_STARTTLS", "true"))
+          context = ssl.create_default_context()
+
+          if use_ssl:
+              with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=30, context=context) as smtp:
+                  smtp.login(smtp_username, smtp_password)
+                  smtp.send_message(message)
+          else:
+              with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as smtp:
+                  smtp.ehlo()
+                  if use_starttls:
+                      smtp.starttls(context=context)
+                      smtp.ehlo()
+                  smtp.login(smtp_username, smtp_password)
+                  smtp.send_message(message)
+          PY
+
+  finalize:
+    name: Config Drift / Finalize
+    if: ${{ always() }}
+    needs: [drift_check, notify_email]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Fail workflow when drift is detected
+        env:
+          DRIFT_DETECTED: ${{ needs.drift_check.outputs.drift_detected }}
+          NOTIFY_RESULT: ${{ needs.notify_email.result }}
+          MAIL_TO: ${{ inputs.MAIL_TO }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${DRIFT_DETECTED}" == "true" ]]; then
+            echo "config drift detected" >&2
+            if [[ -n "${MAIL_TO}" && "${NOTIFY_RESULT}" == "failure" ]]; then
+              echo "alert email delivery failed" >&2
+            fi
+            exit 1
+          fi
