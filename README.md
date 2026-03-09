@@ -9,7 +9,6 @@
 - `.github/workflows/branch-sync-pr.reusable.yml`：分支差异检测并自动开 PR
 - `.github/workflows/reusable-workflow-update-pr.reusable.yml`：批量更新调用方仓库里的 reusable workflow 引用并开 PR
 - `.github/workflows/runner-fallback.reusable.yml`：先探测 self-hosted，再回退 github-hosted
-- `.github/workflows/config-drift-ssh.reusable.yml`：通过 SSH 严格比对远端配置与仓库 SSOT，并在漂移时发邮件告警
 - `.github/workflows/github-app-secret-sync.controlplane.yml`：把 `GH_APP_*` 同步到 private repos 的公共控制面
 
 变更策略：各模块输入字段采用硬切命名，不提供旧字段向后兼容。
@@ -68,71 +67,6 @@ jobs:
 ```
 
 生产环境不要使用 `@main`。统一改为受控版本 tag 或完整 commit SHA（例如 `@v1` 或 `@<40位SHA>`）。
-
-## 1.2 SSH 配置漂移检测
-
-`config-drift-ssh.reusable.yml` 适用于这类仓库：
-
-- 仓库内保存了 SSOT 配置文件
-- 线上机器可通过 SSH 只读拉取实际配置
-- 需要定时检查“仓库配置”和“线上配置”是否漂移
-
-核心输入：
-
-- `RUNS_ON_JSON`：调用方先用 runner probe 决定 runner，再透传进来
-- `SSH_HOST` / `SSH_PORT` / `SSH_USER`：目标机器连接信息
-- `DRIFT_FILE_MAP`：多行 `local_path::remote_path`
-- `MAIL_TO` / `MAIL_FROM` / `MAIL_SMTP_*`：漂移告警邮件配置
-
-核心 secrets：
-
-- `ssh_private_key`
-- `ssh_known_hosts`
-- `mail_smtp_username`
-- `mail_smtp_password`
-
-建议的敏感信息实践：
-
-- SSH 私钥与 SMTP 凭据放 caller 仓库自己的 repository/environment secrets
-- `ssh_known_hosts` 也固定到 secret，避免运行时临时 `ssh-keyscan`
-- 不把这类机器专属凭据做成组织级通用 secret
-
-调用示例：
-
-```yaml
-jobs:
-  runner_probe:
-    uses: quantman888/workflow-reusable/.github/workflows/runner-fallback.reusable.yml@<pinned-ref>
-    with:
-      RUNNER_SELF_HOSTED_LABELS: ${{ vars.RUNNER_SELF_HOSTED_LABELS || 'self-hosted,linux,x64' }}
-      RUNNER_GITHUB_HOSTED_LABEL: ${{ vars.RUNNER_GITHUB_HOSTED_LABEL || 'ubuntu-latest' }}
-      RUNNER_FALLBACK_POLICY: github-hosted
-    secrets:
-      runner_probe_token: ${{ secrets.RUNNER_PROBE_TOKEN }}
-
-  config_drift:
-    needs: [runner_probe]
-    uses: quantman888/workflow-reusable/.github/workflows/config-drift-ssh.reusable.yml@<pinned-ref>
-    with:
-      RUNS_ON_JSON: ${{ needs.runner_probe.outputs.selected_runs_on_json }}
-      SSH_HOST: ${{ vars.DRIFT_SSH_HOST }}
-      SSH_PORT: ${{ vars.DRIFT_SSH_PORT || '22' }}
-      SSH_USER: ${{ vars.DRIFT_SSH_USER || 'root' }}
-      DRIFT_FILE_MAP: |
-        config/app.conf::/etc/myapp/app.conf
-        config/nginx.conf::/etc/nginx/nginx.conf
-      MAIL_TO: ops@example.com
-      MAIL_FROM: ci@example.com
-      MAIL_SMTP_HOST: ${{ vars.DRIFT_MAIL_SMTP_HOST }}
-      MAIL_SMTP_PORT: ${{ vars.DRIFT_MAIL_SMTP_PORT || '587' }}
-      MAIL_SMTP_STARTTLS: ${{ vars.DRIFT_MAIL_SMTP_STARTTLS || 'true' }}
-      MAIL_SMTP_SSL: ${{ vars.DRIFT_MAIL_SMTP_SSL || 'false' }}
-    secrets:
-      ssh_private_key: ${{ secrets.DRIFT_SSH_PRIVATE_KEY }}
-      ssh_known_hosts: ${{ secrets.DRIFT_SSH_KNOWN_HOSTS }}
-      mail_smtp_username: ${{ secrets.DRIFT_MAIL_SMTP_USERNAME }}
-      mail_smtp_password: ${{ secrets.DRIFT_MAIL_SMTP_PASSWORD }}
-```
 
 ## 1.1 GitHub App 治理约定
 
