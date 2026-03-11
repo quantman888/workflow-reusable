@@ -1,0 +1,90 @@
+name: Write Commit Status
+description: Create a commit status through the GitHub Statuses API.
+
+inputs:
+  github-token:
+    description: Token used to call the GitHub Statuses API.
+    required: true
+  repository:
+    description: Target repository in owner/repo format.
+    required: true
+  sha:
+    description: Target commit SHA.
+    required: true
+  context:
+    description: Commit status context.
+    required: true
+  state:
+    description: Commit status state (error, failure, pending, success).
+    required: true
+  description:
+    description: Optional short status description.
+    required: false
+    default: ""
+  target-url:
+    description: Optional URL associated with this status.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Create commit status
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        github_token="${{ inputs.github-token }}"
+        repository="${{ inputs.repository }}"
+        sha="${{ inputs.sha }}"
+        context="${{ inputs.context }}"
+        state="${{ inputs.state }}"
+        description="${{ inputs.description }}"
+        target_url="${{ inputs.target-url }}"
+
+        if [[ -z "${github_token}" ]]; then
+          echo "github-token is required" >&2
+          exit 1
+        fi
+
+        if [[ ! "${repository}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+          echo "Invalid repository: ${repository}" >&2
+          exit 1
+        fi
+
+        if [[ ! "${sha}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+          echo "Invalid sha: ${sha}" >&2
+          exit 1
+        fi
+
+        if [[ -z "${context}" ]]; then
+          echo "context is required" >&2
+          exit 1
+        fi
+
+        case "${state}" in
+          error|failure|pending|success)
+            ;;
+          *)
+            echo "Unsupported state: ${state}" >&2
+            exit 1
+            ;;
+        esac
+
+        api_args=(
+          --method POST
+          -H "Accept: application/vnd.github+json"
+          "repos/${repository}/statuses/${sha}"
+          -f "state=${state}"
+          -f "context=${context}"
+        )
+
+        if [[ -n "${description}" ]]; then
+          api_args+=(-f "description=${description}")
+        fi
+
+        if [[ -n "${target_url}" ]]; then
+          api_args+=(-f "target_url=${target_url}")
+        fi
+
+        GH_TOKEN="${github_token}" gh api "${api_args[@]}" >/dev/null

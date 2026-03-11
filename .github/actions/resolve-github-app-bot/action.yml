@@ -1,0 +1,67 @@
+name: Resolve GitHub App Bot Identity
+description: Resolve the bot account identity for a GitHub App installation token.
+
+inputs:
+  github-token:
+    description: GitHub App installation token used to query the bot user.
+    required: true
+  app-slug:
+    description: GitHub App slug returned by actions/create-github-app-token.
+    required: true
+
+outputs:
+  login:
+    description: GitHub App bot login.
+    value: ${{ steps.resolve.outputs.login }}
+  name:
+    description: Git author name for the GitHub App bot.
+    value: ${{ steps.resolve.outputs.name }}
+  email:
+    description: Git author email for the GitHub App bot.
+    value: ${{ steps.resolve.outputs.email }}
+  user-id:
+    description: Numeric GitHub user id for the GitHub App bot account.
+    value: ${{ steps.resolve.outputs.user_id }}
+  user_id:
+    description: Numeric GitHub user id for the GitHub App bot account.
+    value: ${{ steps.resolve.outputs.user_id }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve bot identity
+      id: resolve
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        github_token="${{ inputs.github-token }}"
+        app_slug="${{ inputs.app-slug }}"
+
+        if [[ -z "${github_token}" ]]; then
+          echo "github-token is required" >&2
+          exit 1
+        fi
+
+        if [[ -z "${app_slug}" ]]; then
+          echo "app-slug is required" >&2
+          exit 1
+        fi
+
+        login="${app_slug}[bot]"
+        user_id="$(
+          GH_TOKEN="${github_token}" \
+            gh api "/users/${login}" --jq '.id'
+        )"
+
+        if [[ -z "${user_id}" || "${user_id}" == "null" ]]; then
+          echo "Failed to resolve bot user id for ${login}" >&2
+          exit 1
+        fi
+
+        {
+          echo "login=${login}"
+          echo "name=${login}"
+          echo "email=${user_id}+${login}@users.noreply.github.com"
+          echo "user_id=${user_id}"
+        } >> "${GITHUB_OUTPUT}"
