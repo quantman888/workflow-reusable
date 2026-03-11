@@ -109,6 +109,7 @@ jobs:
 - 适用：`workflow-reusable` 发布后，批量驱动各业务仓库 bump 到新的 SHA 或版本 tag
 - 运行方式：支持调用方先经 `runner-fallback.reusable.yml` 决定 `RUNS_ON_JSON`，再把选中的 runner 透传给该 reusable
 - `reusable_workflow_path` 留空时，会一次升级该仓 `.github/workflows/` 下所有指向 `reusable_repo` 的 central workflow refs；指定具体 path 时，则只升级该 path
+- 分支/PR 策略：始终复用固定 bot 分支 `automation/reusable-workflow-update`；PR title 会继续写入当前 `target_ref`，但不会再按 `target_ref` 派生新分支，因此调用方仓库只维护同一张 open 更新 PR
 
 shared managed-PR 基础能力统一沉淀在两个 composite action 中：
 

@@ -60,6 +60,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: reusable-workflow-update-pr-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   update_reusable_workflow_ref:
     name: Update Reusable Workflow Ref / Open PR
@@ -145,9 +149,7 @@ jobs:
             exit 1
           fi
 
-          safe_ref="$(printf '%s' "${target_ref}" | sed 's#[^0-9A-Za-z._-]#-#g')"
-          short_ref="${safe_ref:0:24}"
-          branch="chore/reusable-workflow-ref-${short_ref}"
+          branch="automation/reusable-workflow-update"
 
           {
             echo "target_ref=${target_ref}"
@@ -205,6 +207,37 @@ jobs:
           git commit -m "chore(ci): bump reusable workflow ref to ${TARGET_REF}"
           git push --force-with-lease --set-upstream origin "${BRANCH}"
 
+      - name: Guard fixed updater PR topology
+        if: steps.update_refs.outputs.changed == 'true'
+        id: guard_pr
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          BRANCH: ${{ steps.resolve.outputs.branch }}
+          DEFAULT_BRANCH: ${{ steps.resolve.outputs.default_branch }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+
+          pr_head_ref="${REPOSITORY_OWNER}:${BRANCH}"
+          prs_json="$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            "repos/${REPOSITORY}/pulls?state=open&head=${pr_head_ref}")"
+
+          pr_count="$(jq 'length' <<<"${prs_json}")"
+          if [[ "${pr_count}" -gt 1 ]]; then
+            echo "Expected at most one open PR for fixed updater branch ${pr_head_ref}, found ${pr_count}." >&2
+            exit 1
+          fi
+
+          if [[ "${pr_count}" -eq 1 ]]; then
+            existing_base="$(jq -r '.[0].base.ref' <<<"${prs_json}")"
+            if [[ "${existing_base}" != "${DEFAULT_BRANCH}" ]]; then
+              echo "Fixed updater branch ${pr_head_ref} already has an open PR to base ${existing_base}; expected ${DEFAULT_BRANCH}." >&2
+              exit 1
+            fi
+          fi
+
       - name: Open or reuse pull request
         if: steps.update_refs.outputs.changed == 'true'
         id: pr
@@ -232,11 +265,25 @@ jobs:
           EOF
           )"
           pr_head_ref="${REPOSITORY_OWNER}:${BRANCH}"
-
-          existing_pr_number="$(gh api \
+          prs_json="$(gh api \
             -H 'Accept: application/vnd.github+json' \
-            "repos/${REPOSITORY}/pulls?state=open&base=${DEFAULT_BRANCH}&head=${pr_head_ref}" \
-            --jq '.[0].number // ""')"
+            "repos/${REPOSITORY}/pulls?state=open&head=${pr_head_ref}")"
+          pr_count="$(jq 'length' <<<"${prs_json}")"
+
+          if [[ "${pr_count}" -gt 1 ]]; then
+            echo "Expected at most one open PR for fixed updater branch ${pr_head_ref}, found ${pr_count}." >&2
+            exit 1
+          fi
+
+          existing_pr_number=""
+          if [[ "${pr_count}" -eq 1 ]]; then
+            existing_base="$(jq -r '.[0].base.ref' <<<"${prs_json}")"
+            if [[ "${existing_base}" != "${DEFAULT_BRANCH}" ]]; then
+              echo "Fixed updater branch ${pr_head_ref} already has an open PR to base ${existing_base}; expected ${DEFAULT_BRANCH}." >&2
+              exit 1
+            fi
+            existing_pr_number="$(jq -r '.[0].number' <<<"${prs_json}")"
+          fi
 
           if [[ -n "${existing_pr_number}" ]]; then
             gh api \
