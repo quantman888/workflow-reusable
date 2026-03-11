@@ -88,17 +88,10 @@ jobs:
 
       - name: Resolve GitHub App bot identity
         id: bot_identity
-        env:
-          GH_TOKEN: ${{ steps.app_token.outputs.token }}
-        run: |
-          set -euo pipefail
-          app_slug="${{ steps.app_token.outputs.app-slug }}"
-          user_id="$(gh api "/users/${app_slug}[bot]" --jq '.id')"
-
-          {
-            echo "name=${app_slug}[bot]"
-            echo "email=${user_id}+${app_slug}[bot]@users.noreply.github.com"
-          } >> "${GITHUB_OUTPUT}"
+        uses: quantman888/workflow-reusable/.github/actions/resolve-github-app-bot@482bcb760344932e8a93a289e4cff88dfd88e50d
+        with:
+          github-token: ${{ steps.app_token.outputs.token }}
+          app-slug: ${{ steps.app_token.outputs.app-slug }}
 
       - name: Checkout target branch
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

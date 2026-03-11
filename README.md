@@ -1,6 +1,6 @@
 # workflow-reusable
 
-该仓库提供可复用工作流，当前包含：
+该仓库提供可复用工作流与 shared composite actions，当前包含：
 
 - `.github/workflows/docker-publish.reusable.yml`：Docker 镜像构建发布 + 中环门禁
 - `.github/workflows/python-package-publish.reusable.yml`：Python 包构建发布 + 精确 wheel 安装摘要
@@ -10,6 +10,8 @@
 - `.github/workflows/reusable-workflow-update-pr.reusable.yml`：批量更新调用方仓库里的 reusable workflow 引用并开 PR
 - `.github/workflows/runner-fallback.reusable.yml`：先探测 self-hosted，再回退 github-hosted
 - `.github/workflows/github-app-secret-sync.controlplane.yml`：把 `GH_APP_*` 同步到 private repos 的公共控制面
+- `.github/actions/resolve-github-app-bot/action.yml`：解析 GitHub App bot 的 login/name/email/user_id
+- `.github/actions/write-commit-status/action.yml`：通过 GitHub Statuses API 写 commit status
 
 变更策略：各模块输入字段采用硬切命名，不提供旧字段向后兼容。
 
@@ -107,6 +109,18 @@ jobs:
 - 适用：`workflow-reusable` 发布后，批量驱动各业务仓库 bump 到新的 SHA 或版本 tag
 - 运行方式：支持调用方先经 `runner-fallback.reusable.yml` 决定 `RUNS_ON_JSON`，再把选中的 runner 透传给该 reusable
 - `reusable_workflow_path` 留空时，会一次升级该仓 `.github/workflows/` 下所有指向 `reusable_repo` 的 central workflow refs；指定具体 path 时，则只升级该 path
+
+shared managed-PR 基础能力统一沉淀在两个 composite action 中：
+
+- `.github/actions/resolve-github-app-bot/action.yml`
+  - 输入：`github-token`、`app-slug`
+  - 输出：`login`、`name`、`email`、`user_id`（并提供同值 `user-id` 输出）
+  - 用途：统一为 `fork-sync.reusable.yml`、`branch-sync-pr.reusable.yml`、`reusable-workflow-update-pr.reusable.yml` 解析 App bot 身份，避免各 workflow 内联 `gh api /users/<slug>[bot]`
+  - 发布约束：跨仓调用 reusable workflow 时，内部 action 也必须使用 immutable ref；当前仓内 workflow 会把它 pin 到同仓已发布 SHA，再随后续 release/升级流程统一 bump
+- `.github/actions/write-commit-status/action.yml`
+  - 输入：`github-token`、`repository`、`sha`、`context`、`state`、`description`、`target-url`
+  - 实现：直接调用 GitHub Statuses API `POST /repos/{owner}/{repo}/statuses/{sha}`
+  - 控制面约束：调用该 action 的 token 需要具备 `statuses: write`；`context` 应保持稳定且可审计，`description` 保持简短，`target-url` 指向 run、PR 或控制面页面
 
 ## 2. Inputs 说明
 
