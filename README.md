@@ -68,7 +68,7 @@ jobs:
       nexus_password: ${{ secrets.NEXUS_PASSWORD }}
 ```
 
-也可以绕过 channel 规则，直接由 caller 传入显式 tags，并在 push 前先做不可变 tag 检查和 Trivy 扫描：
+也可以绕过 channel 规则，直接由 caller 传入显式 tags，并在 push 前先规划不可变 tag、跳过已存在 tag，再做 Trivy 扫描：
 
 ```yaml
 jobs:
@@ -168,7 +168,7 @@ shared managed-PR 基础能力统一沉淀在两个 composite action 中：
 | `OCI_RELEASE_VERSION` | `string` | 否 | 空字符串 | `OCI_PUBLISH_CHANNEL=release` 时必填，格式 `1.2.3` 或 `1.2.3-rc.1`（可带 `v` 前缀） |
 | `OCI_PUBLISH_LATEST` | `boolean` | 否 | `false` | 仅在稳定版 release（`x.y.z`）时可额外产出 `latest` |
 | `OCI_EXPLICIT_TAGS` | `string` | 否 | 空字符串 | 显式发布 tag/ref 列表，支持换行/逗号/分号分隔；非空时保留 caller 给出的 tag 集合，不再按 channel 自动生成 |
-| `OCI_IMMUTABLE_TAGS` | `string` | 否 | 空字符串 | 发布前必须不存在的 tag/ref 列表；存在或无法证明不存在时失败 |
+| `OCI_IMMUTABLE_TAGS` | `string` | 否 | 空字符串 | 不可变 tag/ref 列表；已存在时跳过且不覆盖，不存在时在扫描通过后发布；无法检查状态时失败 |
 | `OCI_EXTRA_PULL_REGISTRY` | `string` | 否 | 空字符串 | 构建前额外登录的 pull registry，适合私有 base image |
 | `OCI_CACHE_SCOPE` | `string` | 否 | 空字符串 | Buildx GitHub Actions cache scope；非空时启用 `type=gha,scope=<value>` |
 | `OCI_PRE_PUSH_TRIVY_ENABLED` | `boolean` | 否 | `false` | 启用 build/load/Trivy/push 路径，在 push 前阻断漏洞；只支持单平台 |
@@ -232,12 +232,14 @@ jobs:
    - `OCI_PUBLISH_CHANNEL` 仅允许 `none`/`edge`/`release`。
    - `OCI_PUBLISH_CHANNEL=release` 时必须提供 `OCI_RELEASE_VERSION` 并通过正则校验。
    - 稳定版 release（`x.y.z`）才可能追加 `latest`（同时要求 `OCI_PUBLISH_LATEST=true`）。
-2. 不可变 tag 门禁（`Check immutable tags`）：
+2. 不可变 tag 规划（`Plan tag publishing`）：
    - `OCI_IMMUTABLE_TAGS` 非空时，用 `docker buildx imagetools inspect` 检查目标 tag。
-   - 目标已存在则失败；认证/网络错误或无法证明 tag 不存在时也失败。
+   - 已存在的不可变 tag 视为已发布并跳过，绝不覆盖；不存在的不可变 tag 进入待推送集合。
+   - 认证/网络错误或无法检查 tag 状态时失败。
 3. 外环发布：
    - 默认兼容路径：无显式 tag/不可变 tag/pre-push scan 时，继续使用 `docker/build-push-action` 直接 build/push。
-   - 显式 tag、不可变 tag 或 pre-push scan 路径：先 `load: true` 构建到本地 Docker，再按 tag 执行 `docker push`。
+   - 显式 tag、不可变 tag 或 pre-push scan 路径：先 `load: true` 构建到本地 Docker，Trivy 通过后只推送规划出的待推送 tag；`latest` 可移动。
+   - 若所有不可变 tag 已存在且没有待推送 tag，则不重建、不重推，只解析主 tag digest 并输出 no-op summary。
    - `OCI_CACHE_SCOPE` 非空时启用 GitHub Actions cache。
 4. 漏洞扫描门禁：
    - `OCI_PRE_PUSH_TRIVY_ENABLED=true` 时，Trivy 扫描本地 loaded image，扫描通过后才 push；该模式只支持单平台。

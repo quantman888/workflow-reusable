@@ -57,7 +57,7 @@ on:
         type: string
         default: ""
       OCI_IMMUTABLE_TAGS:
-        description: "Optional tags or full refs that must not already exist before push; newline/comma/semicolon separated."
+        description: "Optional tags or full refs that are immutable; existing refs are not overwritten and absent refs are published."
         required: false
         type: string
         default: ""
@@ -315,10 +315,17 @@ jobs:
         if: ${{ inputs.OCI_PRE_PUSH_TRIVY_ENABLED || inputs.OCI_IMMUTABLE_TAGS != '' || inputs.OCI_EXPLICIT_TAGS != '' }}
         env:
           OCI_TARGET_PLATFORMS: ${{ inputs.OCI_TARGET_PLATFORMS }}
+          OCI_EXPLICIT_TAGS: ${{ inputs.OCI_EXPLICIT_TAGS }}
+          OCI_IMMUTABLE_TAGS: ${{ inputs.OCI_IMMUTABLE_TAGS }}
+          OCI_PRE_PUSH_TRIVY_ENABLED: ${{ inputs.OCI_PRE_PUSH_TRIVY_ENABLED }}
         run: |
           set -euo pipefail
           if [[ "${OCI_TARGET_PLATFORMS}" == *","* ]]; then
             echo "pre-push local scan/push path supports a single platform only; got: ${OCI_TARGET_PLATFORMS}" >&2
+            exit 1
+          fi
+          if [[ "${OCI_PRE_PUSH_TRIVY_ENABLED}" != "true" && ( -n "${OCI_EXPLICIT_TAGS//[[:space:],;]/}" || -n "${OCI_IMMUTABLE_TAGS//[[:space:],;]/}" ) ]]; then
+            echo "explicit/immutable local publish path requires OCI_PRE_PUSH_TRIVY_ENABLED=true so images are scanned before push" >&2
             exit 1
           fi
 
@@ -338,36 +345,119 @@ jobs:
           username: ${{ secrets.nexus_username }}
           password: ${{ secrets.nexus_password }}
 
-      - name: Check immutable tags
-        if: ${{ inputs.OCI_PUSH_IMAGE && inputs.OCI_IMMUTABLE_TAGS != '' }}
+      - name: Plan tag publishing
+        id: publish_plan
+        if: ${{ inputs.OCI_PRE_PUSH_TRIVY_ENABLED || inputs.OCI_IMMUTABLE_TAGS != '' || inputs.OCI_EXPLICIT_TAGS != '' }}
         env:
+          OCI_PUSH_IMAGE: ${{ inputs.OCI_PUSH_IMAGE }}
+          OCI_PRE_PUSH_TRIVY_ENABLED: ${{ inputs.OCI_PRE_PUSH_TRIVY_ENABLED }}
+          REQUESTED_TAGS: ${{ steps.tags.outputs.tags }}
           IMMUTABLE_TAGS: ${{ steps.tags.outputs.immutable_tags }}
+          PRIMARY_REF: ${{ steps.tags.outputs.primary_ref }}
         run: |
           set -euo pipefail
 
-          while IFS= read -r ref; do
-            [[ -z "${ref}" ]] && continue
-            echo "Checking immutable tag: ${ref}"
-            if output="$(docker buildx imagetools inspect "${ref}" 2>&1)"; then
-              echo "immutable tag already exists: ${ref}" >&2
+          contains_ref() {
+            local needle="$1"
+            shift || true
+            local item
+            for item in "$@"; do
+              [[ "${item}" == "${needle}" ]] && return 0
+            done
+            return 1
+          }
+
+          write_multiline_output() {
+            local key="$1"
+            shift || true
+            echo "${key}<<EOF"
+            if (($# > 0)); then
+              printf '%s\n' "$@"
+            fi
+            echo "EOF"
+          }
+
+          mapfile -t requested_tags <<< "${REQUESTED_TAGS}"
+          mapfile -t immutable_tags <<< "${IMMUTABLE_TAGS}"
+
+          existing_immutable_tags=()
+          absent_immutable_tags=()
+          skipped_immutable_tags=()
+          push_tags=()
+          build_tags=()
+
+          if [[ "${OCI_PUSH_IMAGE}" == "true" ]]; then
+            for ref in "${immutable_tags[@]}"; do
+              [[ -z "${ref}" ]] && continue
+              echo "Checking immutable tag: ${ref}"
+              if output="$(docker buildx imagetools inspect "${ref}" 2>&1)"; then
+                echo "Immutable tag already exists and will not be overwritten: ${ref}"
+                existing_immutable_tags+=("${ref}")
+                continue
+              fi
+
+              lower_output="$(printf '%s' "${output}" | tr '[:upper:]' '[:lower:]')"
+              if [[ "${lower_output}" == *"not found"* || "${lower_output}" == *"manifest unknown"* || "${lower_output}" == *"no such manifest"* || "${lower_output}" == *"name unknown"* ]]; then
+                echo "Immutable tag is absent and can be published: ${ref}"
+                absent_immutable_tags+=("${ref}")
+                continue
+              fi
+
+              echo "could not inspect immutable tag state: ${ref}" >&2
               printf '%s\n' "${output}" >&2
               exit 1
-            fi
+            done
 
-            lower_output="$(printf '%s' "${output}" | tr '[:upper:]' '[:lower:]')"
-            if [[ "${lower_output}" == *"not found"* || "${lower_output}" == *"manifest unknown"* || "${lower_output}" == *"no such manifest"* || "${lower_output}" == *"name unknown"* ]]; then
-              echo "Tag is absent and can be published: ${ref}"
-              continue
-            fi
+            for ref in "${requested_tags[@]}"; do
+              [[ -z "${ref}" ]] && continue
+              if contains_ref "${ref}" "${existing_immutable_tags[@]}"; then
+                skipped_immutable_tags+=("${ref}")
+                continue
+              fi
+              push_tags+=("${ref}")
+            done
+          fi
 
-            echo "could not prove immutable tag is absent: ${ref}" >&2
-            printf '%s\n' "${output}" >&2
-            exit 1
-          done <<< "${IMMUTABLE_TAGS}"
+          if ((${#push_tags[@]} > 0)); then
+            build_tags=("${push_tags[@]}")
+          elif [[ "${OCI_PRE_PUSH_TRIVY_ENABLED}" == "true" && "${OCI_PUSH_IMAGE}" != "true" ]]; then
+            build_tags=("${requested_tags[@]}")
+          fi
+
+          push_required="false"
+          build_required="false"
+          publish_mode="no-op"
+          build_ref="${PRIMARY_REF}"
+
+          if ((${#push_tags[@]} > 0)); then
+            push_required="true"
+            if ((${#skipped_immutable_tags[@]} > 0)); then
+              publish_mode="partial-push"
+            else
+              publish_mode="full-push"
+            fi
+          fi
+
+          if ((${#build_tags[@]} > 0)); then
+            build_required="true"
+            build_ref="${build_tags[0]}"
+          fi
+
+          {
+            write_multiline_output "push_tags" "${push_tags[@]}"
+            write_multiline_output "build_tags" "${build_tags[@]}"
+            write_multiline_output "existing_immutable_tags" "${existing_immutable_tags[@]}"
+            write_multiline_output "absent_immutable_tags" "${absent_immutable_tags[@]}"
+            write_multiline_output "skipped_immutable_tags" "${skipped_immutable_tags[@]}"
+            echo "push_required=${push_required}"
+            echo "build_required=${build_required}"
+            echo "publish_mode=${publish_mode}"
+            echo "build_ref=${build_ref}"
+          } >> "${GITHUB_OUTPUT}"
 
       - name: Build and load image
         id: local_build
-        if: ${{ inputs.OCI_PRE_PUSH_TRIVY_ENABLED || inputs.OCI_IMMUTABLE_TAGS != '' || inputs.OCI_EXPLICIT_TAGS != '' }}
+        if: ${{ steps.publish_plan.outputs.build_required == 'true' }}
         env:
           DOCKER_BUILD_SUMMARY: "false"
           DOCKER_BUILD_RECORD_UPLOAD: "false"
@@ -378,16 +468,16 @@ jobs:
           platforms: ${{ inputs.OCI_TARGET_PLATFORMS }}
           load: true
           push: false
-          tags: ${{ steps.tags.outputs.tags }}
+          tags: ${{ steps.publish_plan.outputs.build_tags }}
           build-args: ${{ inputs.OCI_BUILD_ARGS }}
           cache-from: ${{ inputs.OCI_CACHE_SCOPE != '' && format('type=gha,scope={0}', inputs.OCI_CACHE_SCOPE) || '' }}
           cache-to: ${{ inputs.OCI_CACHE_SCOPE != '' && format('type=gha,scope={0},mode=max', inputs.OCI_CACHE_SCOPE) || '' }}
 
       - name: Pre-push vulnerability scan
         id: pre_push_vuln_scan
-        if: ${{ inputs.OCI_PRE_PUSH_TRIVY_ENABLED }}
+        if: ${{ inputs.OCI_PRE_PUSH_TRIVY_ENABLED && steps.publish_plan.outputs.build_required == 'true' }}
         env:
-          IMAGE_REF: ${{ steps.tags.outputs.primary_ref }}
+          IMAGE_REF: ${{ steps.publish_plan.outputs.build_ref }}
           OCI_GATE_VULN_SEVERITY: ${{ inputs.OCI_GATE_VULN_SEVERITY }}
           OCI_GATE_VULN_IGNORE_UNFIXED: ${{ inputs.OCI_GATE_VULN_IGNORE_UNFIXED }}
         run: |
@@ -413,9 +503,9 @@ jobs:
             "${IMAGE_REF}"
 
       - name: Push loaded image tags
-        if: ${{ inputs.OCI_PUSH_IMAGE && (inputs.OCI_PRE_PUSH_TRIVY_ENABLED || inputs.OCI_IMMUTABLE_TAGS != '' || inputs.OCI_EXPLICIT_TAGS != '') }}
+        if: ${{ steps.publish_plan.outputs.push_required == 'true' }}
         env:
-          TAGS: ${{ steps.tags.outputs.tags }}
+          TAGS: ${{ steps.publish_plan.outputs.push_tags }}
         run: |
           set -euo pipefail
           while IFS= read -r ref; do
@@ -434,7 +524,7 @@ jobs:
           printf '%s\n' "${inspect_output}"
           digest="$(printf '%s\n' "${inspect_output}" | sed -nE 's/^[[:space:]]*Digest:[[:space:]]*(sha256:[0-9A-Fa-f]{64}).*$/\1/p' | head -n1)"
           if [[ -z "${digest}" ]]; then
-            echo "failed to resolve pushed digest for ${PRIMARY_REF}" >&2
+            echo "failed to resolve digest for ${PRIMARY_REF}" >&2
             exit 1
           fi
           echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
@@ -475,6 +565,10 @@ jobs:
         env:
           IMAGE_REF: ${{ steps.tags.outputs.image_ref }}
           IMAGE_TAGS: ${{ steps.tags.outputs.image_tags }}
+          REQUESTED_TAGS: ${{ steps.tags.outputs.tags }}
+          PUSHED_TAGS: ${{ steps.publish_plan.outputs.push_tags }}
+          SKIPPED_IMMUTABLE_TAGS: ${{ steps.publish_plan.outputs.skipped_immutable_tags }}
+          PUBLISH_MODE: ${{ steps.publish_plan.outputs.publish_mode || 'legacy' }}
           DIGEST: ${{ steps.final_ref.outputs.digest }}
           IMAGE_WITH_DIGEST: ${{ steps.final_ref.outputs.image_with_digest }}
           EXPLICIT_TAGS_USED: ${{ steps.tags.outputs.explicit_tags_used }}
@@ -487,6 +581,19 @@ jobs:
             digest_display="${IMAGE_WITH_DIGEST}"
           fi
 
+          format_refs() {
+            local refs="$1"
+            if [[ -z "${refs}" ]]; then
+              printf '`none`\n'
+              return
+            fi
+            printf '\n'
+            while IFS= read -r ref; do
+              [[ -z "${ref}" ]] && continue
+              printf '  - `%s`\n' "${ref}"
+            done <<< "${refs}"
+          }
+
           {
             echo "### Published OCI Artifact"
             echo ""
@@ -495,6 +602,10 @@ jobs:
             echo "- digest: \`${digest_display}\`"
             echo "- explicit_tags: \`${EXPLICIT_TAGS_USED}\`"
             echo "- pre_push_trivy: \`${PRE_PUSH_TRIVY}\`"
+            echo "- publish_mode: \`${PUBLISH_MODE}\`"
+            echo "- requested_refs:$(format_refs "${REQUESTED_TAGS}")"
+            echo "- pushed_refs:$(format_refs "${PUSHED_TAGS}")"
+            echo "- skipped_existing_immutable_refs:$(format_refs "${SKIPPED_IMMUTABLE_TAGS}")"
           } >> "${GITHUB_STEP_SUMMARY}"
 
   image_gate:
