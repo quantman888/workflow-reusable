@@ -508,9 +508,33 @@ jobs:
           TAGS: ${{ steps.publish_plan.outputs.push_tags }}
         run: |
           set -euo pipefail
+
+          push_ref() {
+            local ref="$1"
+            local attempt output lower_output delay
+
+            for attempt in 1 2 3; do
+              if output="$(docker push "${ref}" 2>&1)"; then
+                printf '%s\n' "${output}"
+                return 0
+              fi
+
+              printf '%s\n' "${output}" >&2
+              lower_output="$(printf '%s' "${output}" | tr '[:upper:]' '[:lower:]')"
+              if [[ "${attempt}" != "3" && ( "${lower_output}" == *"unknown blob"* || "${lower_output}" == *"connection reset"* || "${lower_output}" == *"unexpected eof"* || "${lower_output}" == *"timeout"* ) ]]; then
+                delay=$((attempt * 10))
+                echo "docker push failed for ${ref}; retrying in ${delay}s (${attempt}/3)" >&2
+                sleep "${delay}"
+                continue
+              fi
+
+              return 1
+            done
+          }
+
           while IFS= read -r ref; do
             [[ -z "${ref}" ]] && continue
-            docker push "${ref}"
+            push_ref "${ref}"
           done <<< "${TAGS}"
 
       - name: Resolve pushed digest
