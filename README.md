@@ -68,6 +68,36 @@ jobs:
       nexus_password: ${{ secrets.NEXUS_PASSWORD }}
 ```
 
+也可以绕过 channel 规则，直接由 caller 传入显式 tags，并在 push 前先做不可变 tag 检查和 Trivy 扫描：
+
+```yaml
+jobs:
+  publish:
+    uses: <owner>/workflow-reusable/.github/workflows/docker-publish.reusable.yml@<pinned-ref>
+    with:
+      OCI_REGISTRY: registry-push.example.com
+      OCI_IMAGE_NAME: team/app
+      OCI_DOCKERFILE_PATH: Dockerfile
+      OCI_BUILD_CONTEXT: .
+      OCI_TARGET_PLATFORMS: linux/amd64
+      OCI_EXPLICIT_TAGS: |
+        v1.2.3
+        sha-${{ github.sha }}
+        latest
+      OCI_IMMUTABLE_TAGS: |
+        v1.2.3
+        sha-${{ github.sha }}
+      OCI_EXTRA_PULL_REGISTRY: registry.example.com
+      OCI_CACHE_SCOPE: team-app
+      OCI_PRE_PUSH_TRIVY_ENABLED: true
+      OCI_GATE_VULN_SEVERITY: HIGH,CRITICAL
+    secrets:
+      nexus_username: ${{ secrets.NEXUS_USERNAME }}
+      nexus_password: ${{ secrets.NEXUS_PASSWORD }}
+```
+
+显式 tag 模式只接受短 tag 或当前 `OCI_REGISTRY/OCI_IMAGE_NAME` 下的完整 ref；不会把外部 ref 当成发布目标。
+
 生产环境不要使用 `@main`。统一改为受控版本 tag 或完整 commit SHA（例如 `@v1` 或 `@<40位SHA>`）。
 
 ## 1.1 GitHub App 治理约定
@@ -134,9 +164,15 @@ shared managed-PR 基础能力统一沉淀在两个 composite action 中：
 | `OCI_TARGET_PLATFORMS` | `string` | 否 | `linux/amd64` | Buildx 平台列表 |
 | `OCI_BUILD_ARGS` | `string` | 否 | 空字符串 | 多行 `KEY=VALUE` |
 | `OCI_PUSH_IMAGE` | `boolean` | 否 | `true` | 是否推送镜像到 registry |
-| `OCI_PUBLISH_CHANNEL` | `string` | 否 | `none` | 发布通道，仅允许 `none`/`edge`/`release` |
+| `OCI_PUBLISH_CHANNEL` | `string` | 否 | `none` | 发布通道，仅允许 `none`/`edge`/`release`；当 `OCI_EXPLICIT_TAGS` 非空时不参与 tag 生成 |
 | `OCI_RELEASE_VERSION` | `string` | 否 | 空字符串 | `OCI_PUBLISH_CHANNEL=release` 时必填，格式 `1.2.3` 或 `1.2.3-rc.1`（可带 `v` 前缀） |
 | `OCI_PUBLISH_LATEST` | `boolean` | 否 | `false` | 仅在稳定版 release（`x.y.z`）时可额外产出 `latest` |
+| `OCI_EXPLICIT_TAGS` | `string` | 否 | 空字符串 | 显式发布 tag/ref 列表，支持换行/逗号/分号分隔；非空时保留 caller 给出的 tag 集合，不再按 channel 自动生成 |
+| `OCI_IMMUTABLE_TAGS` | `string` | 否 | 空字符串 | 发布前必须不存在的 tag/ref 列表；存在或无法证明不存在时失败 |
+| `OCI_EXTRA_PULL_REGISTRY` | `string` | 否 | 空字符串 | 构建前额外登录的 pull registry，适合私有 base image |
+| `OCI_CACHE_SCOPE` | `string` | 否 | 空字符串 | Buildx GitHub Actions cache scope；非空时启用 `type=gha,scope=<value>` |
+| `OCI_PRE_PUSH_TRIVY_ENABLED` | `boolean` | 否 | `false` | 启用 build/load/Trivy/push 路径，在 push 前阻断漏洞；只支持单平台 |
+| `OCI_POST_PUSH_GATE_ENABLED` | `boolean` | 否 | `true` | 是否运行发布后的启动/健康/smoke 中环门禁 |
 | `OCI_GATE_TIMEOUT_SECONDS` | `number` | 否 | `60` | 启动门禁/健康检查超时秒数 |
 | `OCI_GATE_RUN_ARGS` | `string` | 否 | 空字符串 | 启动检查时附加的 `docker run` 参数 |
 | `OCI_GATE_COMMAND` | `string` | 否 | 空字符串 | 启动检查时覆盖镜像默认命令，适合对齐 `docker-compose.yml` 的 `command` |
@@ -144,6 +180,8 @@ shared managed-PR 基础能力统一沉淀在两个 composite action 中：
 | `OCI_GATE_SMOKE_CMD` | `string` | 否 | 空字符串 | 可选 smoke 命令，非空时在容器内执行 |
 | `OCI_GATE_VULN_SEVERITY` | `string` | 否 | `CRITICAL,HIGH` | Trivy 漏洞门禁严重级别（逗号分隔） |
 | `OCI_GATE_VULN_IGNORE_UNFIXED` | `boolean` | 否 | `false` | Trivy 扫描是否忽略未修复漏洞 |
+| `OCI_UPLOAD_TRIVY_REPORT` | `boolean` | 否 | `false` | 是否上传 Trivy JSON report artifact；pre-push 扫描模式下不额外生成 post-push report |
+| `RUNS_ON_JSON` | `string` | 否 | `"ubuntu-latest"` | 传给 `runs-on` 的 JSON 值，可直接消费 `runner-fallback.reusable.yml` 输出 |
 
 ## 3. Outputs 说明
 
@@ -177,8 +215,10 @@ jobs:
 
 | 名称 | 必填 | 说明 |
 | --- | --- | --- |
-| `nexus_username` | 否 | Registry 登录用户名；当 `OCI_PUSH_IMAGE=true` 时应提供 |
-| `nexus_password` | 否 | Registry 登录密码；当 `OCI_PUSH_IMAGE=true` 时应提供 |
+| `nexus_username` | 否 | push registry 登录用户名；当 `OCI_PUSH_IMAGE=true` 时应提供。未单独提供 pull registry secret 时也用于 `OCI_EXTRA_PULL_REGISTRY` |
+| `nexus_password` | 否 | push registry 登录密码；当 `OCI_PUSH_IMAGE=true` 时应提供。未单独提供 pull registry secret 时也用于 `OCI_EXTRA_PULL_REGISTRY` |
+| `pull_registry_username` | 否 | 可选 pull registry 登录用户名；未提供时回退 `nexus_username` |
+| `pull_registry_password` | 否 | 可选 pull registry 登录密码；未提供时回退 `nexus_password` |
 
 ## 5. 门禁步骤（硬切规则）
 
@@ -187,41 +227,45 @@ jobs:
 步骤与门禁如下：
 
 1. 外环发布前置：Tag 解析门禁（`Resolve image tags`）：
-   - 固定生成 `sha-<commit前12位>`。
+   - `OCI_EXPLICIT_TAGS` 非空时使用 caller 传入的显式 tag/ref 列表。
+   - `OCI_EXPLICIT_TAGS` 为空时保持旧 channel 逻辑：固定生成 `sha-<commit前12位>`，再按 `OCI_PUBLISH_CHANNEL` 追加 `edge` 或 release tags。
    - `OCI_PUBLISH_CHANNEL` 仅允许 `none`/`edge`/`release`。
    - `OCI_PUBLISH_CHANNEL=release` 时必须提供 `OCI_RELEASE_VERSION` 并通过正则校验。
    - 稳定版 release（`x.y.z`）才可能追加 `latest`（同时要求 `OCI_PUBLISH_LATEST=true`）。
-2. 外环发布：`OCI_PUSH_IMAGE=true` 时执行 `Login to Nexus registry` 与 `Build and push image`。
-3. 输出收敛：`Resolve digest reference` 生成 `image_with_digest`（空 digest 时输出空字符串）。
-4. 中环门禁触发条件：
-   - 仅当 `OCI_PUSH_IMAGE=true` 且 `image_with_digest` 非空时，才运行 `OCI Middle-Ring Gate`（`image_gate` job）。
-5. 镜像启动门禁（`Startup gate`）：
+2. 不可变 tag 门禁（`Check immutable tags`）：
+   - `OCI_IMMUTABLE_TAGS` 非空时，用 `docker buildx imagetools inspect` 检查目标 tag。
+   - 目标已存在则失败；认证/网络错误或无法证明 tag 不存在时也失败。
+3. 外环发布：
+   - 默认兼容路径：无显式 tag/不可变 tag/pre-push scan 时，继续使用 `docker/build-push-action` 直接 build/push。
+   - 显式 tag、不可变 tag 或 pre-push scan 路径：先 `load: true` 构建到本地 Docker，再按 tag 执行 `docker push`。
+   - `OCI_CACHE_SCOPE` 非空时启用 GitHub Actions cache。
+4. 漏洞扫描门禁：
+   - `OCI_PRE_PUSH_TRIVY_ENABLED=true` 时，Trivy 扫描本地 loaded image，扫描通过后才 push；该模式只支持单平台。
+   - `OCI_PRE_PUSH_TRIVY_ENABLED=false` 时，中环门禁继续对 digest image 做 post-push Trivy scan。
+   - 两种模式都使用 `--scanners vuln`，阈值由 `OCI_GATE_VULN_SEVERITY` 控制。
+5. 输出收敛：`Resolve digest reference` 生成 `image_with_digest`（空 digest 时输出空字符串）。
+6. 中环门禁触发条件：
+   - 仅当 `OCI_POST_PUSH_GATE_ENABLED=true`、`OCI_PUSH_IMAGE=true` 且 `image_with_digest` 非空时，才运行 `OCI Middle-Ring Gate`（`image_gate` job）。
+7. 镜像启动门禁（`Startup gate`）：
    - 先按 digest 拉取镜像，再执行 `docker run`，容器必须在超时内进入 `running` 状态。
    - 进入 `running` 后还会做一个短暂稳定性复检，避免“刚启动就退出”的假阳性。
    - 超时由 `OCI_GATE_TIMEOUT_SECONDS` 控制。
    - 可通过 `OCI_GATE_RUN_ARGS` 追加环境变量、挂载和端口，并通过 `OCI_GATE_COMMAND` 对齐调用方的实际启动命令。
    - 门禁 job 会先 checkout 调用仓库；当 `OCI_GATE_RUN_ARGS` 需要引用工作区文件做 bind mount 时，使用 `__GITHUB_WORKSPACE__` 作为占位符，reusable 会在运行时替换成真实工作目录。
-6. 可选健康检查门禁（`Optional health URL check`）：
+8. 可选健康检查门禁（`Optional health URL check`）：
    - `OCI_GATE_HEALTH_URL` 非空时执行 HTTP 健康检查。
-7. 可选 smoke 门禁（`Optional smoke command`）：
+9. 可选 smoke 门禁（`Optional smoke command`）：
    - `OCI_GATE_SMOKE_CMD` 非空时，在容器内执行 smoke 命令。
-8. 漏洞扫描门禁（`Vulnerability scan`）：
-   - 使用 Trivy 扫描 `image_with_digest`。
-   - `OCI_GATE_VULN_SEVERITY` 控制失败阈值，`OCI_GATE_VULN_IGNORE_UNFIXED` 控制是否忽略未修复漏洞。
-9. 中环收尾：`Cleanup gate container` 在结束时清理容器（`always()` 条件）。
+10. 中环收尾：`Cleanup gate container` 在结束时清理容器（`always()` 条件）。
 
 ## 6. 标签示例（仅示意）
 
 设 `image_ref=nexus.example.com/team/app`，`sha=abcdef123456`：
 
-- `OCI_PUBLISH_CHANNEL=none`  
-  产出：`sha-abcdef123456`
-- `OCI_PUBLISH_CHANNEL=edge`  
-  产出：`sha-abcdef123456,edge`
-- `OCI_PUBLISH_CHANNEL=release` + `OCI_RELEASE_VERSION=1.2.3-rc.1` + `OCI_PUBLISH_LATEST=true`  
-  产出：`sha-abcdef123456,1.2.3-rc.1`
-- `OCI_PUBLISH_CHANNEL=release` + `OCI_RELEASE_VERSION=v1.2.3` + `OCI_PUBLISH_LATEST=true`  
-  产出：`sha-abcdef123456,1.2.3,1.2,1,latest`
+- `OCI_PUBLISH_CHANNEL=none`：产出 `sha-abcdef123456`
+- `OCI_PUBLISH_CHANNEL=edge`：产出 `sha-abcdef123456,edge`
+- `OCI_PUBLISH_CHANNEL=release` + `OCI_RELEASE_VERSION=1.2.3-rc.1` + `OCI_PUBLISH_LATEST=true`：产出 `sha-abcdef123456,1.2.3-rc.1`
+- `OCI_EXPLICIT_TAGS=v1.2.3,sha-abcdef123456,latest`：产出 `v1.2.3,sha-abcdef123456,latest`（不再追加 channel tags）
 
 ## 7. Caller Workflow 完整示例
 
@@ -255,6 +299,35 @@ jobs:
       OCI_GATE_SMOKE_CMD: ""
       OCI_GATE_VULN_SEVERITY: HIGH,CRITICAL
       OCI_GATE_VULN_IGNORE_UNFIXED: false
+    secrets:
+      nexus_username: ${{ secrets.NEXUS_USERNAME }}
+      nexus_password: ${{ secrets.NEXUS_PASSWORD }}
+```
+
+显式 tag + pre-push scan 示例：
+
+```yaml
+jobs:
+  docker-publish:
+    uses: <owner>/workflow-reusable/.github/workflows/docker-publish.reusable.yml@<pinned-ref>
+    with:
+      OCI_REGISTRY: registry-push.example.com
+      OCI_IMAGE_NAME: team/app
+      OCI_DOCKERFILE_PATH: Dockerfile
+      OCI_BUILD_CONTEXT: .
+      OCI_TARGET_PLATFORMS: linux/amd64
+      OCI_EXPLICIT_TAGS: |
+        v1.2.3
+        sha-${{ github.sha }}
+        latest
+      OCI_IMMUTABLE_TAGS: |
+        v1.2.3
+        sha-${{ github.sha }}
+      OCI_EXTRA_PULL_REGISTRY: registry.example.com
+      OCI_CACHE_SCOPE: team-app
+      OCI_PRE_PUSH_TRIVY_ENABLED: true
+      OCI_POST_PUSH_GATE_ENABLED: false
+      OCI_GATE_VULN_SEVERITY: HIGH,CRITICAL
     secrets:
       nexus_username: ${{ secrets.NEXUS_USERNAME }}
       nexus_password: ${{ secrets.NEXUS_PASSWORD }}

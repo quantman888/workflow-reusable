@@ -51,6 +51,36 @@ on:
         required: false
         type: boolean
         default: false
+      OCI_EXPLICIT_TAGS:
+        description: "Optional explicit tags or full refs to publish; newline/comma/semicolon separated. Empty preserves channel-based tag generation."
+        required: false
+        type: string
+        default: ""
+      OCI_IMMUTABLE_TAGS:
+        description: "Optional tags or full refs that must not already exist before push; newline/comma/semicolon separated."
+        required: false
+        type: string
+        default: ""
+      OCI_EXTRA_PULL_REGISTRY:
+        description: "Optional additional registry host to login before build for private base image pulls"
+        required: false
+        type: string
+        default: ""
+      OCI_CACHE_SCOPE:
+        description: "Optional GitHub Actions Buildx cache scope"
+        required: false
+        type: string
+        default: ""
+      OCI_PRE_PUSH_TRIVY_ENABLED:
+        description: "Build/load locally and run Trivy before pushing. Supports single-platform builds only."
+        required: false
+        type: boolean
+        default: false
+      OCI_POST_PUSH_GATE_ENABLED:
+        description: "Whether to run the post-push startup/health/smoke gate job"
+        required: false
+        type: boolean
+        default: true
       OCI_GATE_RUN_ARGS:
         description: "Optional docker run args used by startup gate"
         required: false
@@ -104,7 +134,7 @@ on:
         description: "Published image tags as comma-separated list"
         value: ${{ jobs.docker_publish.outputs.image_tags }}
       digest:
-        description: "Image digest from docker/build-push-action"
+        description: "Image digest from the pushed OCI image"
         value: ${{ jobs.docker_publish.outputs.digest }}
       image_with_digest:
         description: "Image reference pinned by digest"
@@ -113,6 +143,10 @@ on:
       nexus_username:
         required: false
       nexus_password:
+        required: false
+      pull_registry_username:
+        required: false
+      pull_registry_password:
         required: false
 
 permissions:
@@ -126,7 +160,7 @@ jobs:
     outputs:
       image_ref: ${{ steps.tags.outputs.image_ref }}
       image_tags: ${{ steps.tags.outputs.image_tags }}
-      digest: ${{ steps.build.outputs.digest }}
+      digest: ${{ steps.final_ref.outputs.digest }}
       image_with_digest: ${{ steps.final_ref.outputs.image_with_digest }}
     defaults:
       run:
@@ -143,57 +177,117 @@ jobs:
           OCI_PUBLISH_CHANNEL: ${{ inputs.OCI_PUBLISH_CHANNEL }}
           OCI_RELEASE_VERSION: ${{ inputs.OCI_RELEASE_VERSION }}
           OCI_PUBLISH_LATEST: ${{ inputs.OCI_PUBLISH_LATEST }}
+          OCI_EXPLICIT_TAGS: ${{ inputs.OCI_EXPLICIT_TAGS }}
+          OCI_IMMUTABLE_TAGS: ${{ inputs.OCI_IMMUTABLE_TAGS }}
           GITHUB_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
 
-          image_ref="${OCI_REGISTRY%/}/${OCI_IMAGE_NAME}"
+          image_ref="${OCI_REGISTRY%/}/${OCI_IMAGE_NAME#/}"
           short_sha="${GITHUB_SHA:0:12}"
           sha_tag="sha-${short_sha}"
 
-          tags=("${image_ref}:${sha_tag}")
-          channel="${OCI_PUBLISH_CHANNEL:-none}"
-          release_version="${OCI_RELEASE_VERSION:-}"
-          stable_release="false"
+          tag_re='^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'
 
-          case "${channel}" in
-            none)
-              ;;
-            edge)
-              tags+=("${image_ref}:edge")
-              ;;
-            release)
-              if [[ -z "${release_version}" ]]; then
-                echo "OCI_RELEASE_VERSION is required when OCI_PUBLISH_CHANNEL=release" >&2
+          normalize_refs() {
+            local raw_value="$1"
+            local output_mode="$2"
+            local -n out_refs="$3"
+            local -n out_bare_tags="$4"
+            local seen=""
+            local raw item tag ref
+
+            while IFS= read -r raw; do
+              item="$(printf '%s' "${raw}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+              [[ -z "${item}" ]] && continue
+
+              if [[ "${item}" == "${image_ref}:"* ]]; then
+                ref="${item}"
+                tag="${item#${image_ref}:}"
+              else
+                if [[ "${item}" == *"/"* || "${item}" == *":"* ]]; then
+                  echo "${output_mode}: full image refs must target ${image_ref}: ${item}" >&2
+                  exit 1
+                fi
+                tag="${item}"
+                ref="${image_ref}:${tag}"
+              fi
+
+              if [[ ! "${tag}" =~ ${tag_re} ]]; then
+                echo "${output_mode}: invalid docker tag: ${tag}" >&2
                 exit 1
               fi
-              normalized_version="${release_version#v}"
-              if [[ ! "${normalized_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
-                echo "invalid OCI_RELEASE_VERSION: ${release_version}" >&2
-                exit 1
-              fi
-              tags+=("${image_ref}:${normalized_version}")
-              if [[ "${normalized_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                stable_release="true"
-                major_minor="${normalized_version%.*}"
-                major="${major_minor%%.*}"
-                tags+=("${image_ref}:${major_minor}")
-                tags+=("${image_ref}:${major}")
-              fi
-              ;;
-            *)
-              echo "invalid OCI_PUBLISH_CHANNEL: ${channel} (allowed: none|edge|release)" >&2
-              exit 1
-              ;;
-          esac
 
-          if [[ "${OCI_PUBLISH_LATEST}" == "true" && "${stable_release}" == "true" ]]; then
-            tags+=("${image_ref}:latest")
+              if [[ " ${seen} " == *" ${ref} "* ]]; then
+                continue
+              fi
+              seen="${seen} ${ref}"
+              out_refs+=("${ref}")
+              out_bare_tags+=("${tag}")
+            done < <(printf '%s\n' "${raw_value}" | tr ',;' '\n')
+          }
+
+          tags=()
+          bare_tags=()
+          immutable_tags=()
+          immutable_bare_tags=()
+          explicit_tags_used="false"
+
+          if [[ -n "${OCI_EXPLICIT_TAGS//[[:space:],;]/}" ]]; then
+            explicit_tags_used="true"
+            normalize_refs "${OCI_EXPLICIT_TAGS}" "OCI_EXPLICIT_TAGS" tags bare_tags
+          else
+            tags=("${image_ref}:${sha_tag}")
+            bare_tags=("${sha_tag}")
+            channel="${OCI_PUBLISH_CHANNEL:-none}"
+            release_version="${OCI_RELEASE_VERSION:-}"
+            stable_release="false"
+
+            case "${channel}" in
+              none)
+                ;;
+              edge)
+                tags+=("${image_ref}:edge")
+                bare_tags+=("edge")
+                ;;
+              release)
+                if [[ -z "${release_version}" ]]; then
+                  echo "OCI_RELEASE_VERSION is required when OCI_PUBLISH_CHANNEL=release" >&2
+                  exit 1
+                fi
+                normalized_version="${release_version#v}"
+                if [[ ! "${normalized_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+                  echo "invalid OCI_RELEASE_VERSION: ${release_version}" >&2
+                  exit 1
+                fi
+                tags+=("${image_ref}:${normalized_version}")
+                bare_tags+=("${normalized_version}")
+                if [[ "${normalized_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                  stable_release="true"
+                  major_minor="${normalized_version%.*}"
+                  major="${major_minor%%.*}"
+                  tags+=("${image_ref}:${major_minor}" "${image_ref}:${major}")
+                  bare_tags+=("${major_minor}" "${major}")
+                fi
+                ;;
+              *)
+                echo "invalid OCI_PUBLISH_CHANNEL: ${channel} (allowed: none|edge|release)" >&2
+                exit 1
+                ;;
+            esac
+
+            if [[ "${OCI_PUBLISH_LATEST}" == "true" && "${stable_release}" == "true" ]]; then
+              tags+=("${image_ref}:latest")
+              bare_tags+=("latest")
+            fi
+          fi
+
+          if [[ -n "${OCI_IMMUTABLE_TAGS//[[:space:],;]/}" ]]; then
+            normalize_refs "${OCI_IMMUTABLE_TAGS}" "OCI_IMMUTABLE_TAGS" immutable_tags immutable_bare_tags
           fi
 
           image_tags_csv=""
-          for full_tag in "${tags[@]}"; do
-            tag="${full_tag#${image_ref}:}"
+          for tag in "${bare_tags[@]}"; do
             if [[ -z "${image_tags_csv}" ]]; then
               image_tags_csv="${tag}"
             else
@@ -205,12 +299,36 @@ jobs:
             echo "tags<<EOF"
             printf '%s\n' "${tags[@]}"
             echo "EOF"
+            echo "immutable_tags<<EOF"
+            printf '%s\n' "${immutable_tags[@]}"
+            echo "EOF"
             echo "image_ref=${image_ref}"
+            echo "primary_ref=${tags[0]}"
             echo "image_tags=${image_tags_csv}"
+            echo "explicit_tags_used=${explicit_tags_used}"
           } >> "${GITHUB_OUTPUT}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Validate pre-push build mode
+        if: ${{ inputs.OCI_PRE_PUSH_TRIVY_ENABLED || inputs.OCI_IMMUTABLE_TAGS != '' || inputs.OCI_EXPLICIT_TAGS != '' }}
+        env:
+          OCI_TARGET_PLATFORMS: ${{ inputs.OCI_TARGET_PLATFORMS }}
+        run: |
+          set -euo pipefail
+          if [[ "${OCI_TARGET_PLATFORMS}" == *","* ]]; then
+            echo "pre-push local scan/push path supports a single platform only; got: ${OCI_TARGET_PLATFORMS}" >&2
+            exit 1
+          fi
+
+      - name: Login to extra pull registry
+        if: ${{ inputs.OCI_EXTRA_PULL_REGISTRY != '' }}
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ inputs.OCI_EXTRA_PULL_REGISTRY }}
+          username: ${{ secrets.pull_registry_username || secrets.nexus_username }}
+          password: ${{ secrets.pull_registry_password || secrets.nexus_password }}
 
       - name: Login to Nexus registry
         if: ${{ inputs.OCI_PUSH_IMAGE }}
@@ -220,8 +338,110 @@ jobs:
           username: ${{ secrets.nexus_username }}
           password: ${{ secrets.nexus_password }}
 
+      - name: Check immutable tags
+        if: ${{ inputs.OCI_PUSH_IMAGE && inputs.OCI_IMMUTABLE_TAGS != '' }}
+        env:
+          IMMUTABLE_TAGS: ${{ steps.tags.outputs.immutable_tags }}
+        run: |
+          set -euo pipefail
+
+          while IFS= read -r ref; do
+            [[ -z "${ref}" ]] && continue
+            echo "Checking immutable tag: ${ref}"
+            if output="$(docker buildx imagetools inspect "${ref}" 2>&1)"; then
+              echo "immutable tag already exists: ${ref}" >&2
+              printf '%s\n' "${output}" >&2
+              exit 1
+            fi
+
+            lower_output="$(printf '%s' "${output}" | tr '[:upper:]' '[:lower:]')"
+            if [[ "${lower_output}" == *"not found"* || "${lower_output}" == *"manifest unknown"* || "${lower_output}" == *"no such manifest"* || "${lower_output}" == *"name unknown"* ]]; then
+              echo "Tag is absent and can be published: ${ref}"
+              continue
+            fi
+
+            echo "could not prove immutable tag is absent: ${ref}" >&2
+            printf '%s\n' "${output}" >&2
+            exit 1
+          done <<< "${IMMUTABLE_TAGS}"
+
+      - name: Build and load image
+        id: local_build
+        if: ${{ inputs.OCI_PRE_PUSH_TRIVY_ENABLED || inputs.OCI_IMMUTABLE_TAGS != '' || inputs.OCI_EXPLICIT_TAGS != '' }}
+        env:
+          DOCKER_BUILD_SUMMARY: "false"
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ${{ inputs.OCI_BUILD_CONTEXT }}
+          file: ${{ inputs.OCI_DOCKERFILE_PATH }}
+          platforms: ${{ inputs.OCI_TARGET_PLATFORMS }}
+          load: true
+          push: false
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: ${{ inputs.OCI_BUILD_ARGS }}
+          cache-from: ${{ inputs.OCI_CACHE_SCOPE != '' && format('type=gha,scope={0}', inputs.OCI_CACHE_SCOPE) || '' }}
+          cache-to: ${{ inputs.OCI_CACHE_SCOPE != '' && format('type=gha,scope={0},mode=max', inputs.OCI_CACHE_SCOPE) || '' }}
+
+      - name: Pre-push vulnerability scan
+        id: pre_push_vuln_scan
+        if: ${{ inputs.OCI_PRE_PUSH_TRIVY_ENABLED }}
+        env:
+          IMAGE_REF: ${{ steps.tags.outputs.primary_ref }}
+          OCI_GATE_VULN_SEVERITY: ${{ inputs.OCI_GATE_VULN_SEVERITY }}
+          OCI_GATE_VULN_IGNORE_UNFIXED: ${{ inputs.OCI_GATE_VULN_IGNORE_UNFIXED }}
+        run: |
+          set -euo pipefail
+
+          trivy_image="aquasec/trivy:latest"
+          scan_args=(
+            image
+            --scanners vuln
+            --format table
+            --exit-code 1
+            --severity "${OCI_GATE_VULN_SEVERITY}"
+          )
+
+          if [[ "${OCI_GATE_VULN_IGNORE_UNFIXED}" == "true" ]]; then
+            scan_args+=(--ignore-unfixed)
+          fi
+
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            "${trivy_image}" \
+            "${scan_args[@]}" \
+            "${IMAGE_REF}"
+
+      - name: Push loaded image tags
+        if: ${{ inputs.OCI_PUSH_IMAGE && (inputs.OCI_PRE_PUSH_TRIVY_ENABLED || inputs.OCI_IMMUTABLE_TAGS != '' || inputs.OCI_EXPLICIT_TAGS != '') }}
+        env:
+          TAGS: ${{ steps.tags.outputs.tags }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r ref; do
+            [[ -z "${ref}" ]] && continue
+            docker push "${ref}"
+          done <<< "${TAGS}"
+
+      - name: Resolve pushed digest
+        id: resolve_pushed_digest
+        if: ${{ inputs.OCI_PUSH_IMAGE && (inputs.OCI_PRE_PUSH_TRIVY_ENABLED || inputs.OCI_IMMUTABLE_TAGS != '' || inputs.OCI_EXPLICIT_TAGS != '') }}
+        env:
+          PRIMARY_REF: ${{ steps.tags.outputs.primary_ref }}
+        run: |
+          set -euo pipefail
+          inspect_output="$(docker buildx imagetools inspect "${PRIMARY_REF}" 2>&1)"
+          printf '%s\n' "${inspect_output}"
+          digest="$(printf '%s\n' "${inspect_output}" | sed -nE 's/^[[:space:]]*Digest:[[:space:]]*(sha256:[0-9A-Fa-f]{64}).*$/\1/p' | head -n1)"
+          if [[ -z "${digest}" ]]; then
+            echo "failed to resolve pushed digest for ${PRIMARY_REF}" >&2
+            exit 1
+          fi
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+
       - name: Build and push image
-        id: build
+        id: legacy_build
+        if: ${{ !(inputs.OCI_PRE_PUSH_TRIVY_ENABLED || inputs.OCI_IMMUTABLE_TAGS != '' || inputs.OCI_EXPLICIT_TAGS != '') }}
         env:
           DOCKER_BUILD_SUMMARY: "false"
           DOCKER_BUILD_RECORD_UPLOAD: "false"
@@ -233,14 +453,17 @@ jobs:
           push: ${{ inputs.OCI_PUSH_IMAGE }}
           tags: ${{ steps.tags.outputs.tags }}
           build-args: ${{ inputs.OCI_BUILD_ARGS }}
+          cache-from: ${{ inputs.OCI_CACHE_SCOPE != '' && format('type=gha,scope={0}', inputs.OCI_CACHE_SCOPE) || '' }}
+          cache-to: ${{ inputs.OCI_CACHE_SCOPE != '' && format('type=gha,scope={0},mode=max', inputs.OCI_CACHE_SCOPE) || '' }}
 
       - name: Resolve digest reference
         id: final_ref
         env:
           IMAGE_REF: ${{ steps.tags.outputs.image_ref }}
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.resolve_pushed_digest.outputs.digest || steps.legacy_build.outputs.digest }}
         run: |
           set -euo pipefail
+          echo "digest=${DIGEST}" >> "${GITHUB_OUTPUT}"
           if [[ -n "${DIGEST}" ]]; then
             echo "image_with_digest=${IMAGE_REF}@${DIGEST}" >> "${GITHUB_OUTPUT}"
           else
@@ -252,8 +475,10 @@ jobs:
         env:
           IMAGE_REF: ${{ steps.tags.outputs.image_ref }}
           IMAGE_TAGS: ${{ steps.tags.outputs.image_tags }}
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.final_ref.outputs.digest }}
           IMAGE_WITH_DIGEST: ${{ steps.final_ref.outputs.image_with_digest }}
+          EXPLICIT_TAGS_USED: ${{ steps.tags.outputs.explicit_tags_used }}
+          PRE_PUSH_TRIVY: ${{ inputs.OCI_PRE_PUSH_TRIVY_ENABLED }}
         run: |
           set -euo pipefail
 
@@ -268,6 +493,8 @@ jobs:
             echo "- image: \`${IMAGE_REF}\`"
             echo "- tags: \`${IMAGE_TAGS}\`"
             echo "- digest: \`${digest_display}\`"
+            echo "- explicit_tags: \`${EXPLICIT_TAGS_USED}\`"
+            echo "- pre_push_trivy: \`${PRE_PUSH_TRIVY}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
 
   image_gate:
@@ -275,7 +502,7 @@ jobs:
     runs-on: ${{ fromJSON(inputs.RUNS_ON_JSON) }}
     timeout-minutes: 20
     needs: docker_publish
-    if: ${{ inputs.OCI_PUSH_IMAGE && needs.docker_publish.outputs.image_with_digest != '' }}
+    if: ${{ inputs.OCI_POST_PUSH_GATE_ENABLED && inputs.OCI_PUSH_IMAGE && needs.docker_publish.outputs.image_with_digest != '' }}
     defaults:
       run:
         shell: bash
@@ -409,6 +636,7 @@ jobs:
 
       - name: Vulnerability scan
         id: vuln_scan
+        if: ${{ !inputs.OCI_PRE_PUSH_TRIVY_ENABLED }}
         env:
           IMAGE_WITH_DIGEST: ${{ needs.docker_publish.outputs.image_with_digest }}
           OCI_GATE_VULN_SEVERITY: ${{ inputs.OCI_GATE_VULN_SEVERITY }}
@@ -436,7 +664,7 @@ jobs:
             "${IMAGE_WITH_DIGEST}"
 
       - name: Generate Trivy JSON report
-        if: ${{ always() && inputs.OCI_UPLOAD_TRIVY_REPORT }}
+        if: ${{ always() && inputs.OCI_UPLOAD_TRIVY_REPORT && !inputs.OCI_PRE_PUSH_TRIVY_ENABLED }}
         env:
           IMAGE_WITH_DIGEST: ${{ needs.docker_publish.outputs.image_with_digest }}
           OCI_GATE_VULN_SEVERITY: ${{ inputs.OCI_GATE_VULN_SEVERITY }}
@@ -469,7 +697,7 @@ jobs:
           fi
 
       - name: Upload Trivy JSON report
-        if: ${{ always() && inputs.OCI_UPLOAD_TRIVY_REPORT }}
+        if: ${{ always() && inputs.OCI_UPLOAD_TRIVY_REPORT && !inputs.OCI_PRE_PUSH_TRIVY_ENABLED }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: trivy-image-report
@@ -485,6 +713,7 @@ jobs:
           VULN_SCAN_OUTCOME: ${{ steps.vuln_scan.outcome }}
           OCI_GATE_HEALTH_URL: ${{ inputs.OCI_GATE_HEALTH_URL }}
           OCI_GATE_SMOKE_CMD: ${{ inputs.OCI_GATE_SMOKE_CMD }}
+          OCI_PRE_PUSH_TRIVY_ENABLED: ${{ inputs.OCI_PRE_PUSH_TRIVY_ENABLED }}
         run: |
           set -euo pipefail
 
@@ -501,7 +730,11 @@ jobs:
               echo "- smoke_check: \`${SMOKE_OUTCOME}\`"
             fi
 
-            echo "- vulnerability_scan: \`${VULN_SCAN_OUTCOME}\`"
+            if [[ "${OCI_PRE_PUSH_TRIVY_ENABLED}" == "true" ]]; then
+              echo "- vulnerability_scan: \`pre-push\`"
+            else
+              echo "- vulnerability_scan: \`${VULN_SCAN_OUTCOME}\`"
+            fi
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Cleanup gate container
