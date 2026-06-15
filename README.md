@@ -41,11 +41,11 @@
 
 文件：`.github/workflows/docker-publish.reusable.yml`
 
-用途：只负责 checkout、registry login、buildx build/push、digest 输出。
+用途：只负责 checkout、registry login、Docker build/push、digest 输出。
 
 不负责 release 语义、tag 推导、漏洞扫描、启动门禁、Nexus 验收或 promotion。
 
-默认关闭 Buildx provenance/SBOM attestation，保持普通 registry 兼容的单平台 image manifest；需要供应链 attestation 的调用方应在独立扫描/签名流程处理。
+默认使用 Buildx registry exporter 推送；`OCI_PUSH_MODE=docker` 时只支持单平台 `linux/amd64`，会先把镜像 load 到 Docker daemon，再用普通 `docker push` 推送。默认关闭 Buildx provenance/SBOM attestation；需要供应链 attestation 的调用方应在独立扫描/签名流程处理。
 
 ### 调用示例
 
@@ -89,6 +89,7 @@ jobs:
 | `OCI_BUILD_ARGS` | `string` | 否 | 空字符串 | 多行 `KEY=VALUE` |
 | `OCI_TAGS` | `string` | 否 | 空字符串 | tag 或当前镜像下完整 ref，支持换行/逗号/分号；空值时只发布 `sha-<commit前12位>` |
 | `OCI_PUSH_IMAGE` | `boolean` | 否 | `true` | 是否推送镜像到 registry；PR 可设为 `false` 只构建 |
+| `OCI_PUSH_MODE` | `string` | 否 | `buildx` | 推送模式：`buildx` 通过 BuildKit registry exporter 推送；`docker` 仅支持 `linux/amd64`，load 后用普通 `docker push` |
 | `OCI_EXTRA_PULL_REGISTRY` | `string` | 否 | 空字符串 | 构建前额外登录的 pull registry，适合私有 base image |
 | `OCI_CACHE_SCOPE` | `string` | 否 | 空字符串 | Buildx GitHub Actions cache scope；非空时启用 `type=gha,scope=<value>` |
 | `RUNS_ON_JSON` | `string` | 否 | `"ubuntu-latest"` | 传给 `runs-on` 的 JSON 值 |
@@ -118,11 +119,12 @@ Nexus 调用方只在 caller workflow 里把 `NEXUS_REGISTRY_USERNAME` / `NEXUS_
 
 1. `actions/checkout`
 2. 解析 `OCI_TAGS`；空值只生成 `sha-<short-sha>`
-3. `docker/setup-buildx-action`
-4. 可选登录 `OCI_EXTRA_PULL_REGISTRY`
-5. 可选登录 `OCI_REGISTRY`
-6. `docker/build-push-action` build/push
-7. 输出 digest summary
+3. 校验 `OCI_PUSH_MODE`
+4. `docker/setup-buildx-action`
+5. 可选登录 `OCI_EXTRA_PULL_REGISTRY`
+6. 可选登录 `OCI_REGISTRY`
+7. `docker/build-push-action` build；`buildx` 模式直接 push，`docker` 模式 load 后执行 `docker push`
+8. 输出 digest summary
 
 扫描、gate、Nexus 验收、release tag 生成、immutable tag 策略全部放到 caller 或独立 workflow，不放在 publish 原语里。
 

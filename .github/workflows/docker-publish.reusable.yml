@@ -41,6 +41,11 @@ on:
         required: false
         type: boolean
         default: true
+      OCI_PUSH_MODE:
+        description: "Image push mode: buildx pushes through BuildKit registry exporter; docker loads a single-platform image then uses docker push"
+        required: false
+        type: string
+        default: "buildx"
       OCI_EXTRA_PULL_REGISTRY:
         description: "Optional additional registry host to login before build for private base image pulls"
         required: false
@@ -194,6 +199,27 @@ jobs:
             echo "image_refs=${image_refs_csv}"
           } >> "${GITHUB_OUTPUT}"
 
+      - name: Validate push mode
+        env:
+          OCI_PUSH_MODE: ${{ inputs.OCI_PUSH_MODE }}
+          OCI_TARGET_PLATFORMS: ${{ inputs.OCI_TARGET_PLATFORMS }}
+        run: |
+          set -euo pipefail
+          case "${OCI_PUSH_MODE}" in
+            buildx)
+              ;;
+            docker)
+              if [[ "${OCI_TARGET_PLATFORMS}" != "linux/amd64" ]]; then
+                echo "OCI_PUSH_MODE=docker only supports OCI_TARGET_PLATFORMS=linux/amd64." >&2
+                exit 1
+              fi
+              ;;
+            *)
+              echo "OCI_PUSH_MODE must be buildx or docker." >&2
+              exit 1
+              ;;
+          esac
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
@@ -223,7 +249,8 @@ jobs:
           context: ${{ inputs.OCI_BUILD_CONTEXT }}
           file: ${{ inputs.OCI_DOCKERFILE_PATH }}
           platforms: ${{ inputs.OCI_TARGET_PLATFORMS }}
-          push: ${{ inputs.OCI_PUSH_IMAGE }}
+          push: ${{ inputs.OCI_PUSH_IMAGE && inputs.OCI_PUSH_MODE == 'buildx' }}
+          load: ${{ inputs.OCI_PUSH_MODE == 'docker' }}
           provenance: false
           sbom: false
           tags: ${{ steps.tags.outputs.tags }}
@@ -231,11 +258,36 @@ jobs:
           cache-from: ${{ inputs.OCI_CACHE_SCOPE != '' && format('type=gha,scope={0}', inputs.OCI_CACHE_SCOPE) || '' }}
           cache-to: ${{ inputs.OCI_CACHE_SCOPE != '' && format('type=gha,scope={0},mode=max', inputs.OCI_CACHE_SCOPE) || '' }}
 
+      - name: Push image with Docker
+        id: docker_push
+        if: ${{ inputs.OCI_PUSH_MODE == 'docker' && inputs.OCI_PUSH_IMAGE }}
+        env:
+          PRIMARY_REF: ${{ steps.tags.outputs.primary_ref }}
+          IMAGE_REFS: ${{ steps.tags.outputs.image_refs }}
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra refs <<< "${IMAGE_REFS}"
+          for ref in "${refs[@]}"; do
+            [[ -z "${ref}" ]] && continue
+            docker push "${ref}"
+          done
+
+          digest="$(docker buildx imagetools inspect "${PRIMARY_REF}" --format '{{.Digest}}')"
+          if [[ -z "${digest}" || "${digest}" == "<no value>" ]]; then
+            image_with_digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "${PRIMARY_REF}" 2>/dev/null || true)"
+            digest="${image_with_digest##*@}"
+          fi
+          if [[ -z "${digest}" || "${digest}" == "<no value>" || "${digest}" != sha256:* ]]; then
+            echo "failed to resolve pushed image digest for ${PRIMARY_REF}" >&2
+            exit 1
+          fi
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+
       - name: Resolve digest reference
         id: final_ref
         env:
           IMAGE_REF: ${{ steps.tags.outputs.image_ref }}
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.build.outputs.digest || steps.docker_push.outputs.digest }}
         run: |
           set -euo pipefail
           echo "digest=${DIGEST}" >> "${GITHUB_OUTPUT}"
@@ -254,6 +306,7 @@ jobs:
           DIGEST: ${{ steps.final_ref.outputs.digest }}
           IMAGE_WITH_DIGEST: ${{ steps.final_ref.outputs.image_with_digest }}
           PUSH_IMAGE: ${{ inputs.OCI_PUSH_IMAGE }}
+          PUSH_MODE: ${{ inputs.OCI_PUSH_MODE }}
         run: |
           set -euo pipefail
 
@@ -269,5 +322,6 @@ jobs:
             echo "- tags: \`${IMAGE_TAGS}\`"
             echo "- refs: \`${IMAGE_REFS}\`"
             echo "- push: \`${PUSH_IMAGE}\`"
+            echo "- push mode: \`${PUSH_MODE}\`"
             echo "- digest: \`${digest_display}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
