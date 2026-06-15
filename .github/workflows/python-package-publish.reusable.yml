@@ -54,9 +54,9 @@ on:
         description: "Exact pip install command for the resolved wheel URL"
         value: ${{ jobs.python_package_publish.outputs.install_command }}
     secrets:
-      nexus_username:
+      repository_username:
         required: false
-      nexus_password:
+      repository_password:
         required: false
 
 permissions:
@@ -145,8 +145,8 @@ jobs:
           PYTHON_PACKAGE_SIMPLE_URL: ${{ inputs.PYTHON_PACKAGE_SIMPLE_URL }}
           PACKAGE_NAME: ${{ steps.metadata.outputs.package_name }}
           DIST_FILES: ${{ steps.metadata.outputs.dist_files }}
-          TWINE_USERNAME: ${{ secrets.nexus_username }}
-          TWINE_PASSWORD: ${{ secrets.nexus_password }}
+          TWINE_USERNAME: ${{ secrets.repository_username }}
+          TWINE_PASSWORD: ${{ secrets.repository_password }}
         run: |
           set -euo pipefail
           python -X utf8 <<'PY'
@@ -244,8 +244,8 @@ jobs:
           DIST_FILES: ${{ steps.metadata.outputs.dist_files }}
           EXISTING_FILE_COUNT: ${{ steps.upload_plan.outputs.existing_file_count }}
           UPLOAD_FILES: ${{ steps.upload_plan.outputs.upload_files }}
-          TWINE_USERNAME: ${{ secrets.nexus_username }}
-          TWINE_PASSWORD: ${{ secrets.nexus_password }}
+          TWINE_USERNAME: ${{ secrets.repository_username }}
+          TWINE_PASSWORD: ${{ secrets.repository_password }}
         run: |
           set -euo pipefail
 
@@ -283,8 +283,8 @@ jobs:
           PYTHON_PACKAGE_TRUSTED_HOST: ${{ inputs.PYTHON_PACKAGE_TRUSTED_HOST }}
           WHEEL_FILENAME: ${{ steps.metadata.outputs.wheel_filename }}
           WHEEL_SHA256: ${{ steps.metadata.outputs.wheel_sha256 }}
-          TWINE_USERNAME: ${{ secrets.nexus_username }}
-          TWINE_PASSWORD: ${{ secrets.nexus_password }}
+          TWINE_USERNAME: ${{ secrets.repository_username }}
+          TWINE_PASSWORD: ${{ secrets.repository_password }}
         run: |
           set -euo pipefail
           python -X utf8 <<'PY'

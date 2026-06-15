@@ -2,9 +2,9 @@
 
 该仓库提供可复用工作流与 shared composite actions，当前包含：
 
-- `.github/workflows/docker-publish.reusable.yml`：Docker 镜像构建发布 + 中环门禁
-- `.github/workflows/python-package-publish.reusable.yml`：Python 包构建发布 + 精确 wheel 安装摘要
-- `.github/workflows/docker-promote.reusable.yml`：按 digest 做发布标签提升
+- `.github/workflows/docker-publish.reusable.yml`：Docker 镜像构建/发布原语
+- `.github/workflows/docker-promote.reusable.yml`：按 digest 把一个源镜像显式提升到目标 refs
+- `.github/workflows/python-package-publish.reusable.yml`：Python 包构建/发布原语
 - `.github/workflows/fork-sync.reusable.yml`：fork 分支快进同步
 - `.github/workflows/branch-sync-pr.reusable.yml`：分支差异检测并自动开 PR
 - `.github/workflows/reusable-workflow-update-pr.reusable.yml`：批量更新调用方仓库里的 reusable workflow 引用并开 PR
@@ -37,42 +37,19 @@
 
 不要把 `.github` 当成运行时控制面，也不要让 caller 仓直接长期跟随 `@main`。
 
-## 1. 调用方式（caller）
+## 1. Docker Publish Reusable
 
-在调用方仓库的 workflow 中通过 `uses` 引用：
+文件：`.github/workflows/docker-publish.reusable.yml`
 
-```yaml
-jobs:
-  publish:
-    uses: <owner>/workflow-reusable/.github/workflows/docker-publish.reusable.yml@<pinned-ref>
-    with:
-      OCI_REGISTRY: ${{ vars.NEXUS_REGISTRY }}
-      OCI_IMAGE_NAME: ${{ vars.IMAGE_NAME }}
-      OCI_DOCKERFILE_PATH: Dockerfile
-      OCI_BUILD_CONTEXT: .
-      OCI_TARGET_PLATFORMS: linux/amd64
-      OCI_BUILD_ARGS: |
-        APP_ENV=prod
-      OCI_PUSH_IMAGE: true
-      OCI_PUBLISH_CHANNEL: release
-      OCI_RELEASE_VERSION: 1.2.3
-      OCI_PUBLISH_LATEST: true
-      OCI_GATE_TIMEOUT_SECONDS: 60
-      OCI_GATE_RUN_ARGS: ""
-      OCI_GATE_HEALTH_URL: ""
-      OCI_GATE_SMOKE_CMD: ""
-      OCI_GATE_VULN_SEVERITY: HIGH,CRITICAL
-      OCI_GATE_VULN_IGNORE_UNFIXED: false
-    secrets:
-      nexus_username: ${{ secrets.NEXUS_USERNAME }}
-      nexus_password: ${{ secrets.NEXUS_PASSWORD }}
-```
+用途：只负责 checkout、registry login、buildx build/push、digest 输出。
 
-也可以绕过 channel 规则，直接由 caller 传入显式 tags，并在 push 前先规划不可变 tag、跳过已存在 tag，再做 Trivy 扫描：
+不负责 release 语义、tag 推导、漏洞扫描、启动门禁、Nexus 验收或 promotion。
+
+### 调用示例
 
 ```yaml
 jobs:
-  publish:
+  docker-publish:
     uses: <owner>/workflow-reusable/.github/workflows/docker-publish.reusable.yml@<pinned-ref>
     with:
       OCI_REGISTRY: registry-push.example.com
@@ -80,27 +57,152 @@ jobs:
       OCI_DOCKERFILE_PATH: Dockerfile
       OCI_BUILD_CONTEXT: .
       OCI_TARGET_PLATFORMS: linux/amd64
-      OCI_EXPLICIT_TAGS: |
-        v1.2.3
+      OCI_BUILD_ARGS: |
+        APP_ENV=prod
+      OCI_TAGS: |
         sha-${{ github.sha }}
-        latest
-      OCI_IMMUTABLE_TAGS: |
-        v1.2.3
-        sha-${{ github.sha }}
+        main
+      OCI_PUSH_IMAGE: true
       OCI_EXTRA_PULL_REGISTRY: registry.example.com
       OCI_CACHE_SCOPE: team-app
-      OCI_PRE_PUSH_TRIVY_ENABLED: true
-      OCI_GATE_VULN_SEVERITY: HIGH,CRITICAL
+      RUNS_ON_JSON: '["self-hosted","Linux","X64","platform-image-build"]'
     secrets:
-      nexus_username: ${{ secrets.NEXUS_USERNAME }}
-      nexus_password: ${{ secrets.NEXUS_PASSWORD }}
+      registry_username: ${{ secrets.NEXUS_REGISTRY_USERNAME }}
+      registry_password: ${{ secrets.NEXUS_REGISTRY_PASSWORD }}
+      pull_registry_username: ${{ secrets.NEXUS_REGISTRY_USERNAME }}
+      pull_registry_password: ${{ secrets.NEXUS_REGISTRY_PASSWORD }}
 ```
-
-显式 tag 模式只接受短 tag 或当前 `OCI_REGISTRY/OCI_IMAGE_NAME` 下的完整 ref；不会把外部 ref 当成发布目标。
 
 生产环境不要使用 `@main`。统一改为受控版本 tag 或完整 commit SHA（例如 `@v1` 或 `@<40位SHA>`）。
 
-## 1.1 GitHub App 治理约定
+### Inputs
+
+| 名称 | 类型 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- |
+| `OCI_REGISTRY` | `string` | 是 | 无 | Docker Registry 地址，例如 `registry-push.example.com` |
+| `OCI_IMAGE_NAME` | `string` | 是 | 无 | 镜像名，例如 `team/app` |
+| `OCI_DOCKERFILE_PATH` | `string` | 否 | `Dockerfile` | Dockerfile 路径 |
+| `OCI_BUILD_CONTEXT` | `string` | 否 | `.` | Docker build context |
+| `OCI_TARGET_PLATFORMS` | `string` | 否 | `linux/amd64` | Buildx 平台列表 |
+| `OCI_BUILD_ARGS` | `string` | 否 | 空字符串 | 多行 `KEY=VALUE` |
+| `OCI_TAGS` | `string` | 否 | 空字符串 | tag 或当前镜像下完整 ref，支持换行/逗号/分号；空值时只发布 `sha-<commit前12位>` |
+| `OCI_PUSH_IMAGE` | `boolean` | 否 | `true` | 是否推送镜像到 registry；PR 可设为 `false` 只构建 |
+| `OCI_EXTRA_PULL_REGISTRY` | `string` | 否 | 空字符串 | 构建前额外登录的 pull registry，适合私有 base image |
+| `OCI_CACHE_SCOPE` | `string` | 否 | 空字符串 | Buildx GitHub Actions cache scope；非空时启用 `type=gha,scope=<value>` |
+| `RUNS_ON_JSON` | `string` | 否 | `"ubuntu-latest"` | 传给 `runs-on` 的 JSON 值 |
+
+### Secrets
+
+| 名称 | 必填 | 说明 |
+| --- | --- | --- |
+| `registry_username` | 否 | push registry 登录用户名；`OCI_PUSH_IMAGE=true` 且 registry 需要认证时提供 |
+| `registry_password` | 否 | push registry 登录密码 |
+| `pull_registry_username` | 否 | 可选 pull registry 登录用户名 |
+| `pull_registry_password` | 否 | 可选 pull registry 登录密码 |
+
+Nexus 调用方只在 caller workflow 里把 `NEXUS_REGISTRY_USERNAME` / `NEXUS_REGISTRY_PASSWORD` 映射到上述通用 secret 名；reusable workflow 不出现 Nexus 专属字段。
+
+### Outputs
+
+| 名称 | 类型 | 说明 |
+| --- | --- | --- |
+| `image_ref` | `string` | 不带 tag 的完整镜像引用，格式 `<registry>/<image_name>` |
+| `image_tags` | `string` | 逗号分隔的 tag 列表（仅 tag 名，不含镜像前缀） |
+| `image_refs` | `string` | 逗号分隔的完整 ref 列表 |
+| `digest` | `string` | `docker/build-push-action` 输出的 digest；未 push 时可能为空 |
+| `image_with_digest` | `string` | 当 `digest` 非空时为 `<registry>/<image_name>@sha256:...`，否则为空字符串 |
+
+### 固定步骤
+
+1. `actions/checkout`
+2. 解析 `OCI_TAGS`；空值只生成 `sha-<short-sha>`
+3. `docker/setup-buildx-action`
+4. 可选登录 `OCI_EXTRA_PULL_REGISTRY`
+5. 可选登录 `OCI_REGISTRY`
+6. `docker/build-push-action` build/push
+7. 输出 digest summary
+
+扫描、gate、Nexus 验收、release tag 生成、immutable tag 策略全部放到 caller 或独立 workflow，不放在 publish 原语里。
+
+## 2. Docker Promote Reusable
+
+文件：`.github/workflows/docker-promote.reusable.yml`
+
+用途：把一个源镜像解析成 digest，再用 `docker buildx imagetools create --tag` 提升到 caller 明确给出的目标 refs。
+
+不推导 `latest`、major/minor、semver，也不判断 release channel。
+
+### 调用示例
+
+```yaml
+jobs:
+  promote:
+    uses: <owner>/workflow-reusable/.github/workflows/docker-promote.reusable.yml@<pinned-ref>
+    with:
+      OCI_SOURCE_REF: registry-push.example.com/team/app:sha-${{ github.sha }}
+      OCI_TARGET_REFS: |
+        registry-push.example.com/team/app:1.2.3
+        registry-push.example.com/team/app:latest
+      RUNS_ON_JSON: '"ubuntu-latest"'
+    secrets:
+      registry_username: ${{ secrets.NEXUS_REGISTRY_USERNAME }}
+      registry_password: ${{ secrets.NEXUS_REGISTRY_PASSWORD }}
+```
+
+### Inputs
+
+| 名称 | 类型 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- |
+| `OCI_SOURCE_REF` | `string` | 是 | 无 | 源镜像完整 ref，可是 tag ref 或 digest ref |
+| `OCI_TARGET_REFS` | `string` | 是 | 无 | 目标完整 tag refs，支持换行/逗号/分号 |
+| `OCI_LOGIN_REGISTRIES` | `string` | 否 | 空字符串 | 登录 registry 列表；空值时从 `OCI_SOURCE_REF` 与 `OCI_TARGET_REFS` 自动提取 |
+| `OCI_PROMOTE_DRY_RUN` | `boolean` | 否 | `false` | 只打印 promotion plan，不创建 tag |
+| `RUNS_ON_JSON` | `string` | 否 | `"ubuntu-latest"` | 传给 `runs-on` 的 JSON 值 |
+
+### Outputs
+
+| 名称 | 类型 | 说明 |
+| --- | --- | --- |
+| `source_ref` | `string` | 源镜像 ref |
+| `digest` | `string` | 源镜像 digest |
+| `source_with_digest` | `string` | 源镜像 digest ref |
+| `promoted_refs` | `string` | 逗号分隔的目标 refs |
+| `promoted_count` | `string` | 创建的目标 ref 数量 |
+
+## 3. Python Package Publish Reusable
+
+文件：`.github/workflows/python-package-publish.reusable.yml`
+
+用途：基于当前仓库源码构建 wheel/sdist，按显式开关上传到 Python package repository，并在 run summary 输出安装命令。
+
+变更策略：Python 包发布与 OCI 发布完全解耦；是否发布由 caller workflow 的显式 job/checkbox 决定，不做仓库智能识别。
+
+### 调用示例
+
+```yaml
+jobs:
+  python-package-publish:
+    uses: <owner>/workflow-reusable/.github/workflows/python-package-publish.reusable.yml@<pinned-ref>
+    with:
+      PYTHON_PACKAGE_REPOSITORY_URL: ${{ vars.NEXUS_PYPI_REPOSITORY_URL }}
+      PYTHON_PACKAGE_SIMPLE_URL: ${{ vars.NEXUS_PYPI_SIMPLE_URL || '' }}
+      PYTHON_PACKAGE_TRUSTED_HOST: ${{ vars.NEXUS_PYPI_TRUSTED_HOST || '' }}
+      PYTHON_PUSH_PACKAGE: true
+      PYTHON_SKIP_EXISTING: true
+    secrets:
+      repository_username: ${{ secrets.NEXUS_REGISTRY_USERNAME }}
+      repository_password: ${{ secrets.NEXUS_REGISTRY_PASSWORD }}
+```
+
+### 关键约定
+
+- 包名与版本从构建产物元数据解析，不要求 caller 额外传入。
+- `PYTHON_PUSH_PACKAGE=false` 时仍会构建并输出元数据，但不会上传。
+- `PYTHON_SKIP_EXISTING=true` 时先查 simple index 中已存在的分发文件，只上传缺失文件。
+- 仅当 `PYTHON_PACKAGE_SIMPLE_URL` 非空且可解析 wheel 下载链接时，summary 才输出精确到 wheel URL + SHA 的安装命令。
+- Python package repository 凭据统一使用 `repository_username` / `repository_password`；Nexus 只在 caller 侧映射。
+
+## 4. GitHub App 治理约定
 
 分支同步类 workflow 统一采用 GitHub App installation token，不再依赖 `github.token`、长期 PAT 或仓库特有兜底 token。
 
@@ -153,237 +255,12 @@ shared managed-PR 基础能力统一沉淀在两个 composite action 中：
   - 实现：直接调用 GitHub Statuses API `POST /repos/{owner}/{repo}/statuses/{sha}`
   - 控制面约束：调用该 action 的 token 需要具备 `statuses: write`；`context` 应保持稳定且可审计，`description` 保持简短，`target-url` 指向 run、PR 或控制面页面
 
-## 2. Inputs 说明
-
-| 名称 | 类型 | 必填 | 默认值 | 说明 |
-| --- | --- | --- | --- | --- |
-| `OCI_REGISTRY` | `string` | 是 | 无 | Docker Registry 地址，例如 `nexus.example.com` |
-| `OCI_IMAGE_NAME` | `string` | 是 | 无 | 镜像名，例如 `team/app` |
-| `OCI_DOCKERFILE_PATH` | `string` | 否 | `Dockerfile` | Dockerfile 路径 |
-| `OCI_BUILD_CONTEXT` | `string` | 否 | `.` | Docker build context |
-| `OCI_TARGET_PLATFORMS` | `string` | 否 | `linux/amd64` | Buildx 平台列表 |
-| `OCI_BUILD_ARGS` | `string` | 否 | 空字符串 | 多行 `KEY=VALUE` |
-| `OCI_PUSH_IMAGE` | `boolean` | 否 | `true` | 是否推送镜像到 registry |
-| `OCI_PUBLISH_CHANNEL` | `string` | 否 | `none` | 发布通道，仅允许 `none`/`edge`/`release`；当 `OCI_EXPLICIT_TAGS` 非空时不参与 tag 生成 |
-| `OCI_RELEASE_VERSION` | `string` | 否 | 空字符串 | `OCI_PUBLISH_CHANNEL=release` 时必填，格式 `1.2.3` 或 `1.2.3-rc.1`（可带 `v` 前缀） |
-| `OCI_PUBLISH_LATEST` | `boolean` | 否 | `false` | 仅在稳定版 release（`x.y.z`）时可额外产出 `latest` |
-| `OCI_EXPLICIT_TAGS` | `string` | 否 | 空字符串 | 显式发布 tag/ref 列表，支持换行/逗号/分号分隔；非空时保留 caller 给出的 tag 集合，不再按 channel 自动生成 |
-| `OCI_IMMUTABLE_TAGS` | `string` | 否 | 空字符串 | 不可变 tag/ref 列表；已存在时跳过且不覆盖，不存在时在扫描通过后发布；无法检查状态时失败 |
-| `OCI_EXTRA_PULL_REGISTRY` | `string` | 否 | 空字符串 | 构建前额外登录的 pull registry，适合私有 base image |
-| `OCI_CACHE_SCOPE` | `string` | 否 | 空字符串 | Buildx GitHub Actions cache scope；非空时启用 `type=gha,scope=<value>` |
-| `OCI_PRE_PUSH_TRIVY_ENABLED` | `boolean` | 否 | `false` | 启用 build/load/Trivy/push 路径，在 push 前阻断漏洞；只支持单平台 |
-| `OCI_POST_PUSH_GATE_ENABLED` | `boolean` | 否 | `true` | 是否运行发布后的启动/健康/smoke 中环门禁 |
-| `OCI_GATE_TIMEOUT_SECONDS` | `number` | 否 | `60` | 启动门禁/健康检查超时秒数 |
-| `OCI_GATE_RUN_ARGS` | `string` | 否 | 空字符串 | 启动检查时附加的 `docker run` 参数 |
-| `OCI_GATE_COMMAND` | `string` | 否 | 空字符串 | 启动检查时覆盖镜像默认命令，适合对齐 `docker-compose.yml` 的 `command` |
-| `OCI_GATE_HEALTH_URL` | `string` | 否 | 空字符串 | 可选健康检查 URL，非空时执行 HTTP 检查 |
-| `OCI_GATE_SMOKE_CMD` | `string` | 否 | 空字符串 | 可选 smoke 命令，非空时在容器内执行 |
-| `OCI_GATE_VULN_SEVERITY` | `string` | 否 | `CRITICAL,HIGH` | Trivy 漏洞门禁严重级别（逗号分隔） |
-| `OCI_GATE_VULN_IGNORE_UNFIXED` | `boolean` | 否 | `false` | Trivy 扫描是否忽略未修复漏洞 |
-| `OCI_UPLOAD_TRIVY_REPORT` | `boolean` | 否 | `false` | 是否上传 Trivy JSON report artifact；pre-push 扫描模式下不额外生成 post-push report |
-| `RUNS_ON_JSON` | `string` | 否 | `"ubuntu-latest"` | 传给 `runs-on` 的 JSON 值，可直接消费 `runner-fallback.reusable.yml` 输出 |
-
-## 3. Outputs 说明
-
-| 名称 | 类型 | 说明 |
-| --- | --- | --- |
-| `image_ref` | `string` | 不带 tag 的完整镜像引用，格式 `<registry>/<image_name>` |
-| `image_tags` | `string` | 逗号分隔的 tag 列表（仅 tag 名，不含镜像前缀） |
-| `digest` | `string` | `Build and push image` 步骤输出的 digest（来自 `docker/build-push-action`） |
-| `image_with_digest` | `string` | 当 `digest` 非空时为 `<registry>/<image_name>@sha256:...`，否则为空字符串 |
-
-调用方可直接消费 outputs（包含 `image_with_digest`）：
-
-```yaml
-jobs:
-  docker-publish:
-    uses: <owner>/workflow-reusable/.github/workflows/docker-publish.reusable.yml@<pinned-ref>
-    with:
-      OCI_REGISTRY: ${{ vars.NEXUS_REGISTRY }}
-      OCI_IMAGE_NAME: ${{ vars.IMAGE_NAME }}
-  deploy:
-    needs: docker-publish
-    runs-on: ubuntu-latest
-    steps:
-      - name: Print image digest ref
-        run: echo "${{ needs.docker-publish.outputs.image_with_digest }}"
-```
-
-运行成功后，OCI job summary 固定输出三行：`image`、`tags`、`digest`；其中 `digest` 行输出完整不可变镜像引用（例如 `nexus.example.com/team/app@sha256:...`），便于直接复制使用。发布后门禁结果仍单独显示在 `Gate Checks` summary。
-
-## 4. Secrets 说明
-
-| 名称 | 必填 | 说明 |
-| --- | --- | --- |
-| `nexus_username` | 否 | push registry 登录用户名；当 `OCI_PUSH_IMAGE=true` 时应提供。未单独提供 pull registry secret 时也用于 `OCI_EXTRA_PULL_REGISTRY` |
-| `nexus_password` | 否 | push registry 登录密码；当 `OCI_PUSH_IMAGE=true` 时应提供。未单独提供 pull registry secret 时也用于 `OCI_EXTRA_PULL_REGISTRY` |
-| `pull_registry_username` | 否 | 可选 pull registry 登录用户名；未提供时回退 `nexus_username` |
-| `pull_registry_password` | 否 | 可选 pull registry 登录密码；未提供时回退 `nexus_password` |
-
-## 5. 门禁步骤（硬切规则）
-
-该工作流采用“中环 + 外环”门禁基座，规则全部由 `OCI_*` 入参显式驱动，不再按分支名或 Git tag 自动推断。
-
-步骤与门禁如下：
-
-1. 外环发布前置：Tag 解析门禁（`Resolve image tags`）：
-   - `OCI_EXPLICIT_TAGS` 非空时使用 caller 传入的显式 tag/ref 列表。
-   - `OCI_EXPLICIT_TAGS` 为空时保持旧 channel 逻辑：固定生成 `sha-<commit前12位>`，再按 `OCI_PUBLISH_CHANNEL` 追加 `edge` 或 release tags。
-   - `OCI_PUBLISH_CHANNEL` 仅允许 `none`/`edge`/`release`。
-   - `OCI_PUBLISH_CHANNEL=release` 时必须提供 `OCI_RELEASE_VERSION` 并通过正则校验。
-   - 稳定版 release（`x.y.z`）才可能追加 `latest`（同时要求 `OCI_PUBLISH_LATEST=true`）。
-2. 不可变 tag 规划（`Plan tag publishing`）：
-   - `OCI_IMMUTABLE_TAGS` 非空时，用 `docker buildx imagetools inspect` 检查目标 tag。
-   - 已存在的不可变 tag 视为已发布并跳过，绝不覆盖；不存在的不可变 tag 进入待推送集合。
-   - 认证/网络错误或无法检查 tag 状态时失败。
-3. 外环发布：
-   - 默认兼容路径：无显式 tag/不可变 tag/pre-push scan 时，继续使用 `docker/build-push-action` 直接 build/push。
-   - 显式 tag、不可变 tag 或 pre-push scan 路径：先 `load: true` 构建到本地 Docker，Trivy 通过后只推送规划出的待推送 tag；`latest` 可移动。
-   - 若所有不可变 tag 已存在且没有待推送 tag，则不重建、不重推，只解析主 tag digest 并输出 no-op summary。
-   - `OCI_CACHE_SCOPE` 非空时启用 GitHub Actions cache。
-4. 漏洞扫描门禁：
-   - `OCI_PRE_PUSH_TRIVY_ENABLED=true` 时，Trivy 扫描本地 loaded image，扫描通过后才 push；该模式只支持单平台。
-   - `OCI_PRE_PUSH_TRIVY_ENABLED=false` 时，中环门禁继续对 digest image 做 post-push Trivy scan。
-   - 两种模式都使用 `--scanners vuln`，阈值由 `OCI_GATE_VULN_SEVERITY` 控制。
-5. 输出收敛：`Resolve digest reference` 生成 `image_with_digest`（空 digest 时输出空字符串）。
-6. 中环门禁触发条件：
-   - 仅当 `OCI_POST_PUSH_GATE_ENABLED=true`、`OCI_PUSH_IMAGE=true` 且 `image_with_digest` 非空时，才运行 `OCI Middle-Ring Gate`（`image_gate` job）。
-7. 镜像启动门禁（`Startup gate`）：
-   - 先按 digest 拉取镜像，再执行 `docker run`，容器必须在超时内进入 `running` 状态。
-   - 进入 `running` 后还会做一个短暂稳定性复检，避免“刚启动就退出”的假阳性。
-   - 超时由 `OCI_GATE_TIMEOUT_SECONDS` 控制。
-   - 可通过 `OCI_GATE_RUN_ARGS` 追加环境变量、挂载和端口，并通过 `OCI_GATE_COMMAND` 对齐调用方的实际启动命令。
-   - 门禁 job 会先 checkout 调用仓库；当 `OCI_GATE_RUN_ARGS` 需要引用工作区文件做 bind mount 时，使用 `__GITHUB_WORKSPACE__` 作为占位符，reusable 会在运行时替换成真实工作目录。
-8. 可选健康检查门禁（`Optional health URL check`）：
-   - `OCI_GATE_HEALTH_URL` 非空时执行 HTTP 健康检查。
-9. 可选 smoke 门禁（`Optional smoke command`）：
-   - `OCI_GATE_SMOKE_CMD` 非空时，在容器内执行 smoke 命令。
-10. 中环收尾：`Cleanup gate container` 在结束时清理容器（`always()` 条件）。
-
-## 6. 标签示例（仅示意）
-
-设 `image_ref=nexus.example.com/team/app`，`sha=abcdef123456`：
-
-- `OCI_PUBLISH_CHANNEL=none`：产出 `sha-abcdef123456`
-- `OCI_PUBLISH_CHANNEL=edge`：产出 `sha-abcdef123456,edge`
-- `OCI_PUBLISH_CHANNEL=release` + `OCI_RELEASE_VERSION=1.2.3-rc.1` + `OCI_PUBLISH_LATEST=true`：产出 `sha-abcdef123456,1.2.3-rc.1`
-- `OCI_EXPLICIT_TAGS=v1.2.3,sha-abcdef123456,latest`：产出 `v1.2.3,sha-abcdef123456,latest`（不再追加 channel tags）
-
-## 7. Caller Workflow 完整示例
-
-```yaml
-name: Build and Publish
-
-on:
-  push:
-    branches:
-      - main
-  workflow_dispatch:
-
-jobs:
-  docker-publish:
-    uses: <owner>/workflow-reusable/.github/workflows/docker-publish.reusable.yml@<pinned-ref>
-    with:
-      OCI_REGISTRY: ${{ vars.NEXUS_REGISTRY }}
-      OCI_IMAGE_NAME: ${{ vars.IMAGE_NAME }}
-      OCI_DOCKERFILE_PATH: Dockerfile
-      OCI_BUILD_CONTEXT: .
-      OCI_TARGET_PLATFORMS: linux/amd64
-      OCI_BUILD_ARGS: |
-        APP_ENV=prod
-      OCI_PUSH_IMAGE: true
-      OCI_PUBLISH_CHANNEL: release
-      OCI_RELEASE_VERSION: ${{ github.ref_name }}
-      OCI_PUBLISH_LATEST: true
-      OCI_GATE_TIMEOUT_SECONDS: 60
-      OCI_GATE_RUN_ARGS: ""
-      OCI_GATE_HEALTH_URL: ""
-      OCI_GATE_SMOKE_CMD: ""
-      OCI_GATE_VULN_SEVERITY: HIGH,CRITICAL
-      OCI_GATE_VULN_IGNORE_UNFIXED: false
-    secrets:
-      nexus_username: ${{ secrets.NEXUS_USERNAME }}
-      nexus_password: ${{ secrets.NEXUS_PASSWORD }}
-```
-
-显式 tag + pre-push scan 示例：
-
-```yaml
-jobs:
-  docker-publish:
-    uses: <owner>/workflow-reusable/.github/workflows/docker-publish.reusable.yml@<pinned-ref>
-    with:
-      OCI_REGISTRY: registry-push.example.com
-      OCI_IMAGE_NAME: team/app
-      OCI_DOCKERFILE_PATH: Dockerfile
-      OCI_BUILD_CONTEXT: .
-      OCI_TARGET_PLATFORMS: linux/amd64
-      OCI_EXPLICIT_TAGS: |
-        v1.2.3
-        sha-${{ github.sha }}
-        latest
-      OCI_IMMUTABLE_TAGS: |
-        v1.2.3
-        sha-${{ github.sha }}
-      OCI_EXTRA_PULL_REGISTRY: registry.example.com
-      OCI_CACHE_SCOPE: team-app
-      OCI_PRE_PUSH_TRIVY_ENABLED: true
-      OCI_POST_PUSH_GATE_ENABLED: false
-      OCI_GATE_VULN_SEVERITY: HIGH,CRITICAL
-    secrets:
-      nexus_username: ${{ secrets.NEXUS_USERNAME }}
-      nexus_password: ${{ secrets.NEXUS_PASSWORD }}
-```
-
-## 8. 变量与密钥配置建议（调用方仓库）
-
-在调用方仓库配置：
-
-- Repository Variables：
-  - `NEXUS_REGISTRY`：例如 `nexus.example.com`
-  - `IMAGE_NAME`：例如 `team/app`
-- Repository Secrets：
-  - `NEXUS_USERNAME`
-  - `NEXUS_PASSWORD`
-
-然后在 caller workflow 里映射到 reusable workflow 的 `with` / `secrets`。
-
-## 8.1 Python Package Publish Reusable
-
-文件：`.github/workflows/python-package-publish.reusable.yml`  
-用途：基于当前仓库源码构建 wheel/sdist，按显式开关上传到 Nexus PyPI，并在 run summary 输出安装命令。  
-变更策略：Python 包发布与 OCI 发布完全解耦；是否发布由 caller workflow 的显式 job/checkbox 决定，不做仓库智能识别。
-
-### 调用示例（caller）
-
-```yaml
-jobs:
-  python-package-publish:
-    uses: <owner>/workflow-reusable/.github/workflows/python-package-publish.reusable.yml@<pinned-ref>
-    with:
-      PYTHON_PACKAGE_REPOSITORY_URL: ${{ vars.NEXUS_PYPI_REPOSITORY_URL }}
-      PYTHON_PACKAGE_SIMPLE_URL: ${{ vars.NEXUS_PYPI_SIMPLE_URL || '' }}
-      PYTHON_PACKAGE_TRUSTED_HOST: ${{ vars.NEXUS_PYPI_TRUSTED_HOST || '' }}
-      PYTHON_PUSH_PACKAGE: true
-      PYTHON_SKIP_EXISTING: true
-    secrets:
-      nexus_username: ${{ secrets.NEXUS_USERNAME }}
-      nexus_password: ${{ secrets.NEXUS_PASSWORD }}
-```
-
-### 关键约定
-
-- 包名与版本从构建产物元数据解析，不要求 caller 额外传入。
-- `PYTHON_PUSH_PACKAGE=false` 时仍会构建并输出元数据，但不会上传。
-- `PYTHON_SKIP_EXISTING=true` 时先查 simple index 中已存在的分发文件，只上传缺失文件，适合 Nexus 这类不支持 `twine --skip-existing` 的仓库。
-- 仅当 `PYTHON_PACKAGE_SIMPLE_URL` 非空且可解析 wheel 下载链接时，summary 才输出精确到 wheel URL + SHA 的安装命令，格式为 `pip install --trusted-host <host> "<package> @ https://...whl#sha256=..."`（如配置了 trusted host）。
-
-## 9. Fork Sync Reusable
+## 5. Fork Sync Reusable
 
 文件：`.github/workflows/fork-sync.reusable.yml`  
 用途：将 fork 的目标分支与上游分支做同步；默认使用 `--ff-only`，也支持显式强制重置。
 
-### Inputs 说明
+### Inputs
 
 | 名称 | 类型 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
@@ -392,7 +269,7 @@ jobs:
 | `upstream_branch` | `string` | 否 | `main` | 上游分支 |
 | `force_reset` | `boolean` | 否 | `false` | 是否强制把目标分支重置到上游分支 |
 
-### Outputs 说明
+### Outputs
 
 | 名称 | 类型 | 说明 |
 | --- | --- | --- |
@@ -401,29 +278,12 @@ jobs:
 | `upstream_sha` | `string` | 上游分支 SHA |
 | `synced` | `string` | 是否执行并完成同步推送（`true/false`） |
 
-### 调用示例（caller）
-
-```yaml
-jobs:
-  sync-main:
-    uses: <owner>/workflow-reusable/.github/workflows/fork-sync.reusable.yml@<pinned-ref>
-    with:
-      target_branch: main
-      upstream_repo: upstream-owner/upstream-repo
-      upstream_branch: main
-      force_reset: false
-    secrets:
-      GH_APP_ID: ${{ secrets.GH_APP_ID }}
-      GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
-      RUNNER_PROBE_TOKEN: ${{ secrets.RUNNER_PROBE_TOKEN }}
-```
-
-## 10. Branch Sync PR Reusable
+## 6. Branch Sync PR Reusable
 
 文件：`.github/workflows/branch-sync-pr.reusable.yml`  
 用途：比较 `target..source` 提交差异；有新增时检查是否已有 open PR，无则通过 REST API 创建 PR。
 
-### Inputs 说明
+### Inputs
 
 | 名称 | 类型 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
@@ -433,7 +293,7 @@ jobs:
 | `pr_body` | `string` | 否 | 自动说明文本 | PR 描述 |
 | `auto_resolve_theirs_paths` | `string` | 否 | 空字符串 | 多行路径列表；发生冲突时这些路径自动采用 source(theirs) |
 
-### Outputs 说明
+### Outputs
 
 | 名称 | 类型 | 说明 |
 | --- | --- | --- |
@@ -442,31 +302,13 @@ jobs:
 | `pr_created` | `string` | 本次是否新建 PR |
 | `pr_url` | `string` | 已有或新建 PR 的 URL |
 
-### 调用示例（caller）
-
-```yaml
-jobs:
-  open-sync-pr:
-    uses: <owner>/workflow-reusable/.github/workflows/branch-sync-pr.reusable.yml@<pinned-ref>
-    with:
-      source_branch: main
-      target_branch: custom/docker
-      pr_title: "chore(sync): merge main into custom/docker"
-      pr_body: "自动同步分支变更并创建 PR。"
-      auto_resolve_theirs_paths: ""
-    secrets:
-      GH_APP_ID: ${{ secrets.GH_APP_ID }}
-      GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
-      RUNNER_PROBE_TOKEN: ${{ secrets.RUNNER_PROBE_TOKEN }}
-```
-
-## 11. Runner Fallback Reusable
+## 7. Runner Fallback Reusable
 
 文件：`.github/workflows/runner-fallback.reusable.yml`  
 用途：先探测 `self-hosted` runner 可用性；可用则走 `self-hosted`，不可用则按策略回退到 `github-hosted`。  
 变更策略：`RUNNER_*` 输入已硬切，不提供旧字段向后兼容。
 
-### Inputs 说明
+### Inputs
 
 | 名称 | 类型 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
@@ -481,7 +323,7 @@ jobs:
 | `RUNNER_PROBE_TIMEOUT_SECONDS` | `number` | 否 | `20` | 每个探测请求的超时秒数 |
 | `RUNNER_FALLBACK_POLICY` | `string` | 否 | `github-hosted` | 回退策略：`github-hosted` / `fail` |
 
-### Outputs 说明
+### Outputs
 
 | 名称 | 类型 | 说明 |
 | --- | --- | --- |
@@ -498,69 +340,11 @@ jobs:
 | `probe_reason` | `string` | 探测结果原因 |
 | `probe_summary` | `string` | 探测摘要 JSON（可用于审计与观测） |
 
-### Secrets 说明
+### Secrets
 
 | 名称 | 必填 | 说明 |
 | --- | --- | --- |
 | `runner_probe_token` | 否 | 用于调用 runner API 的 token；未提供时回退使用 `${{ github.token }}`。组织级探测建议显式提供具有 `admin:org` 的 token |
-
-### 调用示例（caller：先探测，再分 self-hosted / github-hosted 两个 job）
-
-```yaml
-name: CI With Runner Fallback
-
-on:
-  push:
-    branches:
-      - main
-  workflow_dispatch:
-
-permissions:
-  contents: read
-  actions: read
-
-jobs:
-  runner-probe:
-    uses: <owner>/workflow-reusable/.github/workflows/runner-fallback.reusable.yml@<pinned-ref>
-    with:
-      RUNNER_SELF_HOSTED_LABELS: self-hosted,linux,x64,ci-main
-      RUNNER_GITHUB_HOSTED_LABEL: ubuntu-22.04
-      RUNNER_PROBE_SCOPE: auto
-      RUNNER_PROBE_REQUIRE_ONLINE: true
-      RUNNER_PROBE_REQUIRE_IDLE: true
-      RUNNER_MIN_MATCH_COUNT: 1
-      RUNNER_FALLBACK_POLICY: github-hosted
-    secrets:
-      runner_probe_token: ${{ secrets.RUNNER_PROBE_TOKEN }}
-
-  build-self-hosted:
-    name: Build on self-hosted
-    needs: runner-probe
-    if: ${{ needs.runner-probe.outputs.use_self_hosted == 'true' }}
-    runs-on: [self-hosted, linux, x64, ci-main]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Build
-        run: |
-          set -euo pipefail
-          echo "Build on self-hosted runner"
-
-  build-github-hosted:
-    name: Build on github-hosted
-    needs: runner-probe
-    if: ${{ needs.runner-probe.outputs.use_github_hosted == 'true' }}
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Build
-        run: |
-          set -euo pipefail
-          echo "Build on github-hosted runner"
-```
-
-生产环境不要使用 `@main`。统一改为受控版本 tag 或完整 commit SHA（例如 `@v1` 或 `@<40位SHA>`）。
 
 ### 组织级最佳实践
 
