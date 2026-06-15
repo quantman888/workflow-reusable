@@ -224,6 +224,8 @@ jobs:
           file: ${{ inputs.OCI_DOCKERFILE_PATH }}
           platforms: ${{ inputs.OCI_TARGET_PLATFORMS }}
           push: ${{ inputs.OCI_PUSH_IMAGE }}
+          provenance: false
+          sbom: false
           tags: ${{ steps.tags.outputs.tags }}
           build-args: ${{ inputs.OCI_BUILD_ARGS }}
           cache-from: ${{ inputs.OCI_CACHE_SCOPE != '' && format('type=gha,scope={0}', inputs.OCI_CACHE_SCOPE) || '' }}

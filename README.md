@@ -45,6 +45,8 @@
 
 不负责 release 语义、tag 推导、漏洞扫描、启动门禁、Nexus 验收或 promotion。
 
+默认关闭 Buildx provenance/SBOM attestation，保持普通 registry 兼容的单平台 image manifest；需要供应链 attestation 的调用方应在独立扫描/签名流程处理。
+
 ### 调用示例
 
 ```yaml
