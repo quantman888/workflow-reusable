@@ -22,6 +22,11 @@ on:
         required: false
         type: boolean
         default: true
+      PYTHON_BUILD_SDIST:
+        description: "Whether to build the source distribution alongside the wheel"
+        required: false
+        type: boolean
+        default: true
       PYTHON_SKIP_EXISTING:
         description: "Whether existing distributions should be skipped via simple-index preflight"
         required: false
@@ -94,10 +99,16 @@ jobs:
           python -X utf8 -m pip install --upgrade build twine
 
       - name: Build distributions
+        env:
+          PYTHON_BUILD_SDIST: ${{ inputs.PYTHON_BUILD_SDIST }}
         run: |
           set -euo pipefail
           rm -rf build dist *.egg-info
-          python -X utf8 -m build --sdist --wheel
+          if [[ "${PYTHON_BUILD_SDIST}" == "true" ]]; then
+            python -X utf8 -m build --sdist --wheel
+          else
+            python -X utf8 -m build --wheel
+          fi
 
       - name: Resolve package metadata
         id: metadata
